@@ -1,0 +1,42 @@
+[build-system]
+requires = ["uv_build==0.9.2"]
+build-backend = "uv_build"
+
+[project]
+name = "repoguard"
+version = "0.1.0"
+description = "Evidence-driven Python pull-request review and security remediation agent."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["repoguard"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
