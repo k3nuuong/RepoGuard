@@ -12,6 +12,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.163.0",
     "mypy",
     "pytest",
     "pytest-cov",
