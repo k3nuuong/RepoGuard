@@ -1,0 +1,92 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "findings"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "category",
+          "severity",
+          "title",
+          "message",
+          "remediation",
+          "references"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["security", "correctness", "reviewability", "supply_chain"]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "remediation": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "references": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "side", "start_line", "end_line"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "side": {
+                  "type": "string",
+                  "enum": ["old", "new"]
+                },
+                "start_line": {
+                  "type": ["integer", "null"]
+                },
+                "end_line": {
+                  "type": ["integer", "null"]
+                }
+              },
+              "oneOf": [
+                {
+                  "properties": {
+                    "start_line": {"type": "null"},
+                    "end_line": {"type": "null"}
+                  }
+                },
+                {
+                  "properties": {
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

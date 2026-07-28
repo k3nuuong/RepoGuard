@@ -1,10 +1,10 @@
 # RepoGuard
 
-RepoGuard provides an installable typed Python package, an M1 read-only evidence API, and an M2
-deterministic review API. Evidence collection models a local Git repository plus pull-request base
-and head refs, resolves their unique merge base, and returns immutable changed-file metadata and
-UTF-8 diff hunks. Binary files, symlinks, and submodules remain traceable through modes and object
-IDs without lossy text conversion.
+RepoGuard provides an installable typed Python package, an M1 read-only evidence API, an M2
+deterministic review API, and an M3 controlled Agent review API. Evidence collection models a local
+Git repository plus pull-request base and head refs, resolves their unique merge base, and returns
+immutable changed-file metadata and UTF-8 diff hunks. Binary files, symlinks, and submodules remain
+traceable through modes and object IDs without lossy text conversion.
 
 Evidence collection reads committed Git objects only. It does not inspect dirty worktree content,
 fetch missing history, call language models, create patches, or write to the repository or GitHub.
@@ -79,6 +79,44 @@ M2 scans only addition lines and head-side metadata already present in the evide
 not read complete files, inspect unchanged repository content, suppress findings by path, or provide
 rule configuration or a review CLI. The catalog is a focused deterministic review layer, not a
 comprehensive security scanner.
+
+## Review With An Agent
+
+```python
+from repoguard.agent import (
+    AgentReviewConfig,
+    agent_review_to_json,
+    review_with_agent,
+)
+from repoguard.providers import OpenAIProvider
+
+provider = OpenAIProvider(api_key=openai_api_key)
+agent_review = review_with_agent(
+    evidence,
+    provider=provider,
+    config=AgentReviewConfig(model="provider-native-model-id"),
+)
+canonical_agent_json = agent_review_to_json(agent_review)
+```
+
+M3 also provides `AnthropicProvider`. Both adapters require an API key passed directly to the
+constructor and an explicit provider-native model ID in `AgentReviewConfig`; RepoGuard does not read
+credentials or models from environment variables, dotenv, or configuration files. The synchronous
+workflow runs M2 first, makes at most three bounded provider attempts, validates strict structured
+output and evidence references locally, preserves all M2 Findings, and returns no partial result
+after a failure. Apart from the explicitly requested provider API call, it uses no tools,
+persistence, retrieval, patch generation, or writes to the repository, GitHub, or artifacts.
+
+The complete prompt must fit the configured byte limit. RepoGuard fails without calling the
+provider when it is too large; it does not truncate, rank, summarize, or retrieve context. Before a
+request, it redacts only addition lines covered by M2 `private_key_material` Findings. Other diff
+content, old-side content, and secrets that M2 did not identify may be sent to the configured
+provider. Callers must decide whether that provider boundary is appropriate for their repository.
+
+The automated suite uses fake providers and mocked SDK responses. It makes no real model or provider
+endpoint calls and therefore makes no claim about model review quality. The six M2 rules and the M3
+model workflow are not a comprehensive security scanner. RepoGuard still exposes no review CLI;
+the CLI remains limited to `--version`.
 
 ## Verify
 
