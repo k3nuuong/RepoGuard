@@ -2,14 +2,19 @@
 
 RepoGuard provides an installable typed Python package, an M1 read-only evidence API, an M2
 deterministic review API, an M3 controlled Agent review API, and M4 bounded hybrid context retrieval
-with an opt-in retrieval-enhanced Agent workflow. Evidence collection models a local Git repository
-plus pull-request base and head refs, resolves their unique merge base, and returns immutable
-changed-file metadata and UTF-8 diff hunks. Binary files, symlinks, and submodules remain traceable
-through modes and object IDs without lossy text conversion.
+with an opt-in retrieval-enhanced Agent workflow. M5 adds approval-gated safe repair that validates a
+deterministic candidate in rootless Docker and can publish only a dedicated local Git ref. Evidence
+collection models a local Git repository plus pull-request base and head refs, resolves their unique
+merge base, and returns immutable changed-file metadata and UTF-8 diff hunks. Binary files,
+symlinks, and submodules remain traceable through modes and object IDs without lossy text
+conversion.
 
 Evidence collection reads committed Git objects only. It does not inspect dirty worktree content,
 fetch missing history, call language models, create patches, or write to the repository or GitHub.
 Deterministic review consumes collected evidence in memory and performs no additional I/O.
+Safe repair is a separate opt-in Python API. It freezes one exact HEAD, requires an exact local
+approval over the candidate and validation digests, and never updates HEAD, the worktree, the index,
+configuration, remotes, or a caller-selected ref.
 
 ## Requirements
 
@@ -19,9 +24,15 @@ Deterministic review consumes collected evidence in memory and performs no addit
 - A POSIX environment exposing `/dev/fd` or `/proc/self/fd` for evidence collection
 - SQLite with FTS5 for M4 text retrieval
 - An explicit model cache outside the reviewed repository for fixed-BGE retrieval
+- Linux x86_64 with rootless Docker, cgroup v2, seccomp, and memory/CPU/PID controls for M5 repair
+- The repository-owned validation image built and verified by the maintenance workflow below
 
 M4 CPU and CUDA retrieval are verified on Python 3.12/Linux x86_64. CUDA additionally requires a
 compatible caller-supplied CUDA and cuDNN native runtime.
+
+M5 rootless validation is measured on Docker client/server 29.6.1, API 1.55, and runc 1.3.6. These
+versions are a tested configuration, not an exact-version gate; runtime capability probes remain
+authoritative and fail closed.
 
 ## Install
 
@@ -200,6 +211,52 @@ nDCG@12 were `1.000000`, `0.913492`, and `0.934577` with deterministic fake embe
 CPU/CUDA top-12 IDs also matched on the fixed no-near-tie subset. These measurements establish value
 on the checked-in retrieval dataset; they do not establish live-model review quality or make
 RepoGuard a comprehensive security scanner.
+
+## Repair With Local Approval
+
+`repoguard.repair.RepairManager` binds one repository and creates durable local sessions from an
+exact schema-1 EvidenceBundle, one ReviewResult, explicit targets and allowed paths, generation
+policy, and validation policy. A session follows `propose`, `preview`, `approve`, and `apply`.
+Approval requires the exact candidate ID, validation digest, and this fixed confirmation:
+
+```text
+I approve this exact RepoGuard candidate and validation result for ref-only application.
+```
+
+Successful application publishes only
+`refs/repoguard/repairs/<candidate-id>`. M5 does not authenticate the declared subject, expose a
+repair CLI, contact GitHub, push a remote, or provide remote approval.
+
+### Maintain The Validation Image
+
+The complete image definition is in
+`src/repoguard/repair_assets/validation_image_v1/`. `Dockerfile` pins one official Python
+linux/amd64 manifest, and canonical `image-lock.json` binds the upstream index, platform manifest,
+base config, upstream revision, Dockerfile, local image ID, final config digest, Python, and Git.
+The historical externally supplied image is retired.
+
+Build is a deliberate maintenance action. It may contact Docker Hub only to obtain the exact pinned
+base and never publishes an image:
+
+```bash
+./scripts/manage-repair-image.sh build /run/user/$(id -u)/docker.sock
+```
+
+Verification is local-only. It authenticates the rootless daemon capabilities and locked image,
+then checks Python and Git with `pull=never`, `network=none`, a read-only root filesystem, no
+capabilities, and no-new-privileges:
+
+```bash
+./scripts/manage-repair-image.sh verify /run/user/$(id -u)/docker.sock
+```
+
+To refresh the image, review and pin the new upstream index, linux/amd64 manifest, config digest,
+and source revision; update the Dockerfile and its SHA-256 in `image-lock.json`; run `build` once to
+obtain the candidate local image ID; inspect and record its final config digest; then run `build`
+twice from no-cache and require the same locked image and config identities. Finish with `verify`,
+the focused image/package tests, the real packaged sandbox probe, and `./scripts/check.sh`.
+Production `ValidationPolicy.image_id` must use the locked local image ID, never the maintenance tag
+or a floating registry reference.
 
 ## Verify
 

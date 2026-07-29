@@ -42,6 +42,9 @@ python_version = "3.12"
 strict = true
 warn_unused_configs = true
 
+[tool.uv.build-backend]
+source-include = ["scripts/manage-repair-image.sh"]
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers --disable-socket"
 testpaths = ["tests"]
