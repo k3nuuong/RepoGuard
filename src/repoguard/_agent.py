@@ -130,6 +130,7 @@ class _AgentState(TypedDict):
     bundle: EvidenceBundle
     review: ReviewResult | None
     rendered: _RenderedPrompt | None
+    extension: object | None
     response: LLMResponse | None
     candidates: tuple[AgentFinding, ...]
     findings: tuple[AgentFinding, ...]
@@ -189,6 +190,7 @@ def _review_with_agent(
         "bundle": bundle,
         "review": None,
         "rendered": None,
+        "extension": None,
         "response": None,
         "candidates": (),
         "findings": (),
@@ -267,6 +269,29 @@ def _build_graph(
     provider: LLMProvider,
     config: AgentReviewConfig,
 ) -> CompiledStateGraph[_AgentState, None, _AgentState, _AgentState]:
+    return _build_graph_variant(
+        provider=provider,
+        config=config,
+        retrieval_node=None,
+        build_prompt_node=lambda state: _build_prompt_node(state, config=config),
+        finalize_node=lambda state, provider_binding: _finalize_node(
+            state,
+            provider_binding=provider_binding,
+            config=config,
+        ),
+        graph_name="repoguard-agent-review",
+    )
+
+
+def _build_graph_variant(
+    *,
+    provider: LLMProvider,
+    config: AgentReviewConfig,
+    retrieval_node: Callable[[_AgentState], dict[str, object]] | None,
+    build_prompt_node: Callable[[_AgentState], dict[str, object]],
+    finalize_node: Callable[[_AgentState, _ProviderBinding], dict[str, object]],
+    graph_name: str,
+) -> CompiledStateGraph[_AgentState, None, _AgentState, _AgentState]:
     provider_binding = _ProviderBinding()
     builder = StateGraph(_AgentState)
     builder.add_node(
@@ -279,9 +304,11 @@ def _build_graph(
         ),
     )
     builder.add_node(AgentNode.DETERMINISTIC_REVIEW.value, _deterministic_review_node)
+    if retrieval_node is not None:
+        builder.add_node("retrieve_context", lambda state: retrieval_node(state))
     builder.add_node(
         AgentNode.BUILD_PROMPT.value,
-        lambda state: _build_prompt_node(state, config=config),
+        lambda state: build_prompt_node(state),
     )
     builder.add_node(
         AgentNode.INVOKE_PROVIDER.value,
@@ -298,19 +325,16 @@ def _build_graph(
     builder.add_node(AgentNode.MERGE_FINDINGS.value, _merge_findings_node)
     builder.add_node(
         AgentNode.FINALIZE.value,
-        lambda state: _finalize_node(
-            state,
-            provider_binding=provider_binding,
-            config=config,
-        ),
+        lambda state: finalize_node(state, provider_binding),
     )
 
     builder.add_edge(START, AgentNode.VALIDATE.value)
     builder.add_edge(AgentNode.VALIDATE.value, AgentNode.DETERMINISTIC_REVIEW.value)
-    builder.add_edge(
-        AgentNode.DETERMINISTIC_REVIEW.value,
-        AgentNode.BUILD_PROMPT.value,
-    )
+    after_review = AgentNode.BUILD_PROMPT.value
+    if retrieval_node is not None:
+        after_review = "retrieve_context"
+        builder.add_edge("retrieve_context", AgentNode.BUILD_PROMPT.value)
+    builder.add_edge(AgentNode.DETERMINISTIC_REVIEW.value, after_review)
     builder.add_edge(AgentNode.BUILD_PROMPT.value, AgentNode.INVOKE_PROVIDER.value)
     builder.add_conditional_edges(
         AgentNode.INVOKE_PROVIDER.value,
@@ -323,9 +347,7 @@ def _build_graph(
     builder.add_edge(AgentNode.PARSE_RESPONSE.value, AgentNode.MERGE_FINDINGS.value)
     builder.add_edge(AgentNode.MERGE_FINDINGS.value, AgentNode.FINALIZE.value)
     builder.add_edge(AgentNode.FINALIZE.value, END)
-    return builder.compile(
-        checkpointer=None, store=None, debug=False, name="repoguard-agent-review"
-    )
+    return builder.compile(checkpointer=None, store=None, debug=False, name=graph_name)
 
 
 def _validate_node(
