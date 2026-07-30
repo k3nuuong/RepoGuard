@@ -236,6 +236,101 @@ jobs:
           provider: none
           repository-path: reviewed-repository
 
+      - name: Record stable product failure diagnostics
+        if: >-
+          ${{
+            failure() &&
+            steps.review.outcome == 'failure' &&
+            steps.review.outputs.result-sha256 == ''
+          }}
+        shell: bash
+        env:
+          REPOGUARD_DIAGNOSTIC_BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+          REPOGUARD_DIAGNOSTIC_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          REPOGUARD_DIAGNOSTIC_PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          REPOGUARD_ANTHROPIC_API_KEY: ""
+          REPOGUARD_GITHUB_TOKEN: ${{ github.token }}
+          REPOGUARD_OPENAI_API_KEY: ""
+        run: |
+          set -euo pipefail
+          umask 077
+          diagnostic_root="$(
+            mktemp -d -p "$RUNNER_TEMP" repoguard-m6-diagnostic.XXXXXXXX
+          )"
+          diagnostic_output="$diagnostic_root/envelope.json"
+          diagnostic_stderr="$diagnostic_root/stderr"
+          set +e
+          python3 -I -m repoguard \
+            --profile "$REPOGUARD_HOST_PROFILE" \
+            --repository "$REPOGUARD_REPOSITORY_ALIAS" \
+            review run \
+            --base-ref "$REPOGUARD_DIAGNOSTIC_BASE_SHA" \
+            --head-ref "$REPOGUARD_DIAGNOSTIC_HEAD_SHA" \
+            --review-profile deterministic \
+            --github-pr "$REPOGUARD_DIAGNOSTIC_PR_NUMBER" \
+            > "$diagnostic_output" \
+            2> "$diagnostic_stderr"
+          diagnostic_status="$?"
+          set -e
+          export REPOGUARD_DIAGNOSTIC_OUTPUT="$diagnostic_output"
+          export REPOGUARD_DIAGNOSTIC_STATUS="$diagnostic_status"
+          export REPOGUARD_DIAGNOSTIC_STDERR="$diagnostic_stderr"
+          /usr/bin/python3 -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_path = Path(os.environ["REPOGUARD_DIAGNOSTIC_OUTPUT"])
+          stderr_path = Path(os.environ["REPOGUARD_DIAGNOSTIC_STDERR"])
+          status = int(os.environ["REPOGUARD_DIAGNOSTIC_STATUS"])
+          safe = {
+              "exit_status": status,
+              "stderr_empty": stderr_path.stat().st_size == 0,
+          }
+          try:
+              raw = output_path.read_bytes()
+              if not 2 <= len(raw) <= 4 * 1024 * 1024 + 4097:
+                  raise ValueError
+              envelope = json.loads(raw)
+              if type(envelope) is not dict:
+                  raise ValueError
+              safe["operation"] = envelope.get("operation")
+              safe["ok"] = envelope.get("ok")
+              if envelope.get("ok") is False:
+                  error = envelope.get("error")
+                  if type(error) is not dict:
+                      raise ValueError
+                  for name in (
+                      "domain",
+                      "code",
+                      "retryable",
+                      "stage",
+                      "attempt_count",
+                  ):
+                      safe[name] = error.get(name)
+              elif envelope.get("ok") is True:
+                  result = envelope.get("result")
+                  if type(result) is not dict:
+                      raise ValueError
+                  for name in (
+                      "review_sha256",
+                      "finding_count",
+                      "github_write_supported",
+                  ):
+                      safe[name] = result.get(name)
+          except (OSError, TypeError, ValueError, json.JSONDecodeError):
+              safe["diagnostic"] = "invalid_product_output"
+          print(
+              json.dumps(
+                  safe,
+                  allow_nan=False,
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+          )
+          PY
+
       - name: Record exact review coordinates
         if: ${{ always() }}
         shell: bash
