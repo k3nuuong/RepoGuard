@@ -1,0 +1,104 @@
+name: M6 acceptance publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Exact publication kind.
+        required: true
+        type: choice
+        options:
+          - check
+          - repair
+      proposal_sha256:
+        description: Exact domain-separated proposal identity.
+        required: true
+        type: string
+      source_run_id:
+        description: Exact source workflow run ID.
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact source workflow run attempt.
+        required: true
+        default: "1"
+        type: string
+      artifact_id:
+        description: Exact source proposal artifact ID.
+        required: true
+        type: string
+      artifact_digest:
+        description: Exact source proposal artifact SHA-256 digest.
+        required: true
+        type: string
+      confirmation:
+        description: Exact fixed human publication confirmation.
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: m6-publisher-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  protected-publication:
+    if: >-
+      ${{
+        github.repository == 'k3nuuong/RepoGuard' &&
+        github.ref == 'refs/heads/main' &&
+        github.actor == 'k3nuuong' &&
+        github.triggering_actor == 'k3nuuong'
+      }}
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - repoguard-publisher
+    timeout-minutes: 20
+    environment:
+      name: repoguard-publish
+    env:
+      REPOGUARD_ACTION_SOURCE_ROOT: ${{ vars.REPOGUARD_ACTION_SOURCE_ROOT }}
+      REPOGUARD_HOST_PROFILE: ${{ vars.REPOGUARD_HOST_PROFILE }}
+      REPOGUARD_PYTHON: ${{ vars.REPOGUARD_PYTHON }}
+      REPOGUARD_REPOSITORY_ALIAS: acceptance
+      REPOGUARD_RUNNER_LABELS: '["Linux","X64","repoguard-publisher","self-hosted"]'
+      DOCKER_HOST: ""
+    steps:
+      - name: Publish exact approved proposal
+        id: publish
+        uses: k3nuuong/RepoGuard/actions/publish@f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3
+        env:
+          REPOGUARD_ANTHROPIC_API_KEY: ""
+          REPOGUARD_GITHUB_TOKEN: ${{ secrets.REPOGUARD_GITHUB_TOKEN }}
+          REPOGUARD_OPENAI_API_KEY: ""
+        with:
+          artifact-digest: ${{ inputs.artifact_digest }}
+          artifact-id: ${{ inputs.artifact_id }}
+          confirmation: ${{ inputs.confirmation }}
+          kind: ${{ inputs.kind }}
+          proposal-sha256: ${{ inputs.proposal_sha256 }}
+          source-run-attempt: ${{ inputs.source_run_attempt }}
+          source-run-id: ${{ inputs.source_run_id }}
+
+      - name: Record exact publication result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          REPOGUARD_APPROVAL_SHA256: ${{ steps.publish.outputs.approval-sha256 }}
+          REPOGUARD_RESULT_SHA256: ${{ steps.publish.outputs.result-sha256 }}
+          REPOGUARD_STATE: ${{ steps.publish.outputs.state }}
+        run: |
+          {
+            printf '\n## M6 publication result\n\n'
+            printf -- '- publication run: `%s`\n' "$GITHUB_RUN_ID"
+            printf -- '- publication attempt: `%s`\n' "$GITHUB_RUN_ATTEMPT"
+            printf -- '- approval SHA-256: `%s`\n' "$REPOGUARD_APPROVAL_SHA256"
+            printf -- '- result SHA-256: `%s`\n' "$REPOGUARD_RESULT_SHA256"
+            printf -- '- state: `%s`\n' "$REPOGUARD_STATE"
+          } >> "$GITHUB_STEP_SUMMARY"
