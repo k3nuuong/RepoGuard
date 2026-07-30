@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      REPOGUARD_HOST_PROFILE: ${{ runner.temp }}/repoguard-m6-hosted-${{ github.run_id }}-${{ github.run_attempt }}/profile.json
+      REPOGUARD_HOST_PROFILE: ${{ github.workspace }}/.repoguard-m6-hosted-${{ github.run_id }}-${{ github.run_attempt }}/profile.json
       REPOGUARD_REPOSITORY_ALIAS: acceptance
       REPOGUARD_REVIEW_REPOSITORY: ${{ github.workspace }}/reviewed-repository
       REPOGUARD_TRUSTED_SOURCE: ${{ github.workspace }}/trusted-source
