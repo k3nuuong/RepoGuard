@@ -50,6 +50,18 @@ _CANONICAL_M5_JSON_FILES = (
 )
 _M5_PACKAGE_FILES = ("repair.py", *_REPAIR_MODULE_FILES, *_M5_RESOURCE_FILES)
 _M5_SDIST_FILES = ("scripts/manage-repair-image.sh",)
+_M6_MODULE_FILES = (
+    "_canonical.py",
+    "_github_store.py",
+    "_product.py",
+    "cli.py",
+    "github.py",
+    "github_publication.py",
+    "github_transport.py",
+    "host_profile.py",
+    "mcp_server.py",
+    "product.py",
+)
 _SDIST_ROOT = "repoguard-0.1.0"
 
 
@@ -123,6 +135,11 @@ def test_runtime_metadata_constrains_the_direct_onnx_runtime_import() -> None:
 
     assert dependencies is not None
     assert "onnxruntime-gpu<1.28" in dependencies
+    assert "mcp==2.0.0" in dependencies
+
+
+def test_package_root_exports_only_the_version() -> None:
+    assert repoguard.__all__ == ["__version__"]
 
 
 def test_py_typed_marker_is_packaged() -> None:
@@ -231,3 +248,43 @@ def test_m5_repair_surface_is_in_wheel_and_sdist(
             assert extracted is not None
             assert extracted.read() == (_PROJECT_ROOT / relative_path).read_bytes()
             assert member.mode == 0o755
+
+
+def test_complete_source_package_and_product_entry_point_are_in_archives(
+    built_distributions: tuple[Path, Path],
+) -> None:
+    wheel_path, sdist_path = built_distributions
+    source_package = _PROJECT_ROOT / "src" / "repoguard"
+    source_files = {
+        path.relative_to(source_package).as_posix(): path.read_bytes()
+        for path in source_package.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    }
+    assert set(_M6_MODULE_FILES) <= source_files.keys()
+
+    with zipfile.ZipFile(wheel_path) as wheel:
+        members = set(wheel.namelist())
+        for relative_path, expected in source_files.items():
+            member = f"repoguard/{relative_path}"
+            assert member in members, relative_path
+            assert wheel.read(member) == expected, relative_path
+        entry_points = tuple(
+            member for member in members if member.endswith(".dist-info/entry_points.txt")
+        )
+        assert len(entry_points) == 1
+        assert wheel.read(entry_points[0]).decode("utf-8").strip().splitlines() == [
+            "[console_scripts]",
+            "repoguard = repoguard.cli:main",
+        ]
+
+    with tarfile.open(sdist_path, mode="r:gz") as sdist:
+        members = set(sdist.getnames())
+        for relative_path, expected in source_files.items():
+            member_name = f"{_SDIST_ROOT}/src/repoguard/{relative_path}"
+            assert member_name in members, relative_path
+            tar_member = sdist.getmember(member_name)
+            extracted = sdist.extractfile(tar_member)
+            assert extracted is not None
+            assert extracted.read() == expected, relative_path

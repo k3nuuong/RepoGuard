@@ -7,7 +7,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 from repoguard._repair_paths import (
     _canonical_repository_paths,
     _validate_container_path,
+    _validate_repository_path,
 )
 from repoguard.evidence import EvidenceBundle, RepositoryInput
 from repoguard.providers import AnthropicProvider, OpenAIProvider
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "REPAIR_APPROVAL_CONFIRMATION",
+    "REPAIR_PUBLICATION_AUTHOR_EMAIL",
+    "REPAIR_PUBLICATION_AUTHOR_NAME",
+    "REPAIR_PUBLICATION_COMMIT_MESSAGE",
+    "REPAIR_PUBLICATION_COMMIT_TIMESTAMP",
     "RepairApplication",
     "RepairApproval",
     "RepairCandidate",
@@ -42,6 +47,9 @@ __all__ = [
     "RepairPreview",
     "RepairPromptIdentity",
     "RepairProviderKind",
+    "RepairPublicationBlob",
+    "RepairPublicationEntry",
+    "RepairPublicationManifest",
     "RepairSession",
     "RepairSnapshot",
     "RepairStage",
@@ -52,6 +60,8 @@ __all__ = [
     "ValidationCommandResult",
     "ValidationFailureKind",
     "ValidationPolicy",
+    "read_repair_preview",
+    "read_repair_snapshot",
     "repair_application_to_dict",
     "repair_application_to_json",
     "repair_approval_to_dict",
@@ -74,6 +84,10 @@ __all__ = [
     "repair_preview_to_json",
     "repair_prompt_identity_to_dict",
     "repair_prompt_identity_to_json",
+    "repair_publication_entry_to_dict",
+    "repair_publication_entry_to_json",
+    "repair_publication_manifest_to_dict",
+    "repair_publication_manifest_to_json",
     "repair_snapshot_to_dict",
     "repair_snapshot_to_json",
     "repair_target_to_dict",
@@ -91,11 +105,19 @@ __all__ = [
 REPAIR_APPROVAL_CONFIRMATION = (
     "I approve this exact RepoGuard candidate and validation result for ref-only application."
 )
+REPAIR_PUBLICATION_AUTHOR_NAME = "RepoGuard"
+REPAIR_PUBLICATION_AUTHOR_EMAIL = "repoguard@localhost"
+REPAIR_PUBLICATION_COMMIT_MESSAGE = "RepoGuard safe repair candidate\n"
+REPAIR_PUBLICATION_COMMIT_TIMESTAMP = "1970-01-01T00:00:00Z"
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _OID_PATTERN = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _IMAGE_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SESSION_PATTERN = _SHA256_PATTERN
+_OBJECT_FORMAT_OID_LENGTHS = {"sha1": 40, "sha256": 64}
+_MAX_PUBLICATION_ENTRIES = 32
+_MAX_PUBLICATION_BLOB_BYTES = 16 * 1_024 * 1_024
+_MAX_PUBLICATION_TOTAL_BYTES = 512 * 1_024 * 1_024
 
 
 class RepairState(StrEnum):
@@ -794,6 +816,114 @@ class RepairApplication:
 
 
 @dataclass(frozen=True, slots=True)
+class RepairPublicationEntry:
+    """Content-free identity of one changed blob in an applied repair commit."""
+
+    schema_version: int
+    path: str
+    mode: str
+    blob_oid: str
+    size: int
+
+    def __post_init__(self) -> None:
+        _require_schema(self.schema_version)
+        _validate_repository_path(self.path)
+        if self.mode not in {"100644", "100755"}:
+            raise ValueError("publication entry mode is invalid")
+        _require_pattern(self.blob_oid, _OID_PATTERN, "blob_oid")
+        _require_bounded_int(
+            self.size,
+            "size",
+            minimum=0,
+            maximum=_MAX_PUBLICATION_BLOB_BYTES,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RepairPublicationManifest:
+    """Path-safe, content-free Git identity for one applied repair publication."""
+
+    schema_version: int
+    manifest_sha256: str
+    session_id: str
+    application_sha256: str
+    approval_sha256: str
+    candidate_id: str
+    object_format: str
+    ref: str
+    parent_oid: str
+    tree_oid: str
+    commit_oid: str
+    entries: tuple[RepairPublicationEntry, ...]
+    total_blob_bytes: int
+
+    def __post_init__(self) -> None:
+        _require_schema(self.schema_version)
+        _require_sha256_fields(
+            self,
+            "manifest_sha256",
+            "session_id",
+            "application_sha256",
+            "approval_sha256",
+            "candidate_id",
+        )
+        if type(self.object_format) is not str:
+            raise TypeError("publication object_format must be a string")
+        oid_length = _OBJECT_FORMAT_OID_LENGTHS.get(self.object_format)
+        if oid_length is None:
+            raise ValueError("publication object_format is invalid")
+        for name in ("parent_oid", "tree_oid", "commit_oid"):
+            value = getattr(self, name)
+            _require_pattern(value, _OID_PATTERN, name)
+            if len(value) != oid_length:
+                raise ValueError(f"{name} does not match object_format")
+        _require_utf8(self.ref, "ref")
+        if self.ref != f"refs/repoguard/repairs/{self.candidate_id}":
+            raise ValueError("publication ref does not match candidate")
+        _require_tuple(
+            self.entries,
+            "entries",
+            minimum=1,
+            maximum=_MAX_PUBLICATION_ENTRIES,
+        )
+        if any(type(entry) is not RepairPublicationEntry for entry in self.entries):
+            raise TypeError("entries must contain exact RepairPublicationEntry values")
+        paths = tuple(entry.path for entry in self.entries)
+        if paths != tuple(sorted(paths, key=str.encode)) or len(set(paths)) != len(paths):
+            raise ValueError("publication entries must have unique canonical ordering")
+        if any(len(entry.blob_oid) != oid_length for entry in self.entries):
+            raise ValueError("publication entry OID does not match object_format")
+        _require_bounded_int(
+            self.total_blob_bytes,
+            "total_blob_bytes",
+            minimum=0,
+            maximum=_MAX_PUBLICATION_TOTAL_BYTES,
+        )
+        if self.total_blob_bytes != sum(entry.size for entry in self.entries):
+            raise ValueError("publication total_blob_bytes does not match entries")
+
+
+@dataclass(frozen=True, slots=True)
+class RepairPublicationBlob:
+    """One verified publication blob held only in memory."""
+
+    schema_version: int
+    manifest_sha256: str
+    entry: RepairPublicationEntry
+    content: bytes = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _require_schema(self.schema_version)
+        _require_pattern(self.manifest_sha256, _SHA256_PATTERN, "manifest_sha256")
+        if type(self.entry) is not RepairPublicationEntry:
+            raise TypeError("entry must be an exact RepairPublicationEntry")
+        if type(self.content) is not bytes:
+            raise TypeError("content must be exact bytes")
+        if len(self.content) != self.entry.size:
+            raise ValueError("publication blob size does not match entry")
+
+
+@dataclass(frozen=True, slots=True)
 class RepairDecision:
     """Local rejection, cancellation, or expiry declaration."""
 
@@ -1097,6 +1227,43 @@ class RepairSession:
         expected_approval_sha256 = ""
         return _unwrap_public_outcome(outcome)
 
+    def publication_manifest(
+        self,
+        *,
+        expected_application_sha256: str,
+    ) -> RepairPublicationManifest:
+        """Revalidate and describe the exact Git objects of an applied repair."""
+        from repoguard._repair_workflow import _publication_manifest
+
+        outcome = _public_call(
+            lambda: _publication_manifest(
+                self,
+                expected_application_sha256=expected_application_sha256,
+            )
+        )
+        expected_application_sha256 = ""
+        return _unwrap_public_outcome(outcome)
+
+    def publication_blob(
+        self,
+        *,
+        manifest: RepairPublicationManifest,
+        entry: RepairPublicationEntry,
+    ) -> RepairPublicationBlob:
+        """Read one blob after revalidating its complete publication manifest."""
+        from repoguard._repair_workflow import _publication_blob
+
+        outcome = _public_call(
+            lambda: _publication_blob(
+                self,
+                manifest=manifest,
+                entry=entry,
+            )
+        )
+        manifest = cast(RepairPublicationManifest, None)
+        entry = cast(RepairPublicationEntry, None)
+        return _unwrap_public_outcome(outcome)
+
     def reject(
         self,
         *,
@@ -1140,6 +1307,46 @@ class RepairSession:
         from repoguard._repair_workflow import _snapshot
 
         return _unwrap_public_outcome(_public_call(lambda: _snapshot(self)))
+
+
+def read_repair_snapshot(
+    repository: RepositoryInput,
+    config: RepairManagerConfig,
+    session_id: str,
+) -> RepairSnapshot:
+    """Read one verified session snapshot without creating or repairing state."""
+    if type(repository) is not RepositoryInput:
+        raise TypeError("repository must be an exact RepositoryInput")
+    if type(config) is not RepairManagerConfig:
+        raise TypeError("config must be an exact RepairManagerConfig")
+    _require_pattern(session_id, _SESSION_PATTERN, "session_id")
+    from repoguard._repair_workflow import _read_session_snapshot
+
+    outcome = _public_call(lambda: _read_session_snapshot(repository, config, session_id))
+    repository = cast(RepositoryInput, None)
+    config = cast(RepairManagerConfig, None)
+    session_id = ""
+    return _unwrap_public_outcome(outcome)
+
+
+def read_repair_preview(
+    repository: RepositoryInput,
+    config: RepairManagerConfig,
+    session_id: str,
+) -> RepairPreview:
+    """Read one verified redacted preview without creating or repairing state."""
+    if type(repository) is not RepositoryInput:
+        raise TypeError("repository must be an exact RepositoryInput")
+    if type(config) is not RepairManagerConfig:
+        raise TypeError("config must be an exact RepairManagerConfig")
+    _require_pattern(session_id, _SESSION_PATTERN, "session_id")
+    from repoguard._repair_workflow import _read_session_preview
+
+    outcome = _public_call(lambda: _read_session_preview(repository, config, session_id))
+    repository = cast(RepositoryInput, None)
+    config = cast(RepairManagerConfig, None)
+    session_id = ""
+    return _unwrap_public_outcome(outcome)
 
 
 def repair_manager_config_to_dict(value: RepairManagerConfig) -> dict[str, object]:
@@ -1389,6 +1596,50 @@ def repair_application_to_dict(value: RepairApplication) -> dict[str, object]:
 def repair_application_to_json(value: RepairApplication) -> str:
     """Serialize a repair application as canonical JSON."""
     return _canonical_json(repair_application_to_dict(value))
+
+
+def repair_publication_entry_to_dict(value: RepairPublicationEntry) -> dict[str, object]:
+    """Convert one publication entry to its canonical content-free mapping."""
+    _require_exact(value, RepairPublicationEntry, "value")
+    return {
+        "schema_version": value.schema_version,
+        "path": value.path,
+        "mode": value.mode,
+        "blob_oid": value.blob_oid,
+        "size": value.size,
+    }
+
+
+def repair_publication_entry_to_json(value: RepairPublicationEntry) -> str:
+    """Serialize one publication entry as canonical JSON."""
+    return _canonical_json(repair_publication_entry_to_dict(value))
+
+
+def repair_publication_manifest_to_dict(
+    value: RepairPublicationManifest,
+) -> dict[str, object]:
+    """Convert a publication manifest to its canonical content-free mapping."""
+    _require_exact(value, RepairPublicationManifest, "value")
+    return {
+        "schema_version": value.schema_version,
+        "manifest_sha256": value.manifest_sha256,
+        "session_id": value.session_id,
+        "application_sha256": value.application_sha256,
+        "approval_sha256": value.approval_sha256,
+        "candidate_id": value.candidate_id,
+        "object_format": value.object_format,
+        "ref": value.ref,
+        "parent_oid": value.parent_oid,
+        "tree_oid": value.tree_oid,
+        "commit_oid": value.commit_oid,
+        "entries": [repair_publication_entry_to_dict(entry) for entry in value.entries],
+        "total_blob_bytes": value.total_blob_bytes,
+    }
+
+
+def repair_publication_manifest_to_json(value: RepairPublicationManifest) -> str:
+    """Serialize a publication manifest as canonical JSON."""
+    return _canonical_json(repair_publication_manifest_to_dict(value))
 
 
 def repair_decision_to_dict(value: RepairDecision) -> dict[str, object]:

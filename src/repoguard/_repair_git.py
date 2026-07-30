@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import re
 import shlex
@@ -21,7 +23,14 @@ from typing import BinaryIO, NoReturn
 from repoguard._repair_patch import _ParsedPatch
 from repoguard._repair_paths import _canonical_repository_paths, _validate_repository_path
 from repoguard.evidence import RepositoryInput
-from repoguard.repair import RepairError, RepairErrorCode, RepairStage
+from repoguard.repair import (
+    REPAIR_PUBLICATION_AUTHOR_EMAIL,
+    REPAIR_PUBLICATION_AUTHOR_NAME,
+    REPAIR_PUBLICATION_COMMIT_MESSAGE,
+    RepairError,
+    RepairErrorCode,
+    RepairStage,
+)
 
 _OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
 _OID_PATTERN = re.compile(r"^[0-9a-f]+$")
@@ -30,8 +39,8 @@ _PROC_SELF_FD_PATTERN = re.compile(r"(?:^|[=,:])(/proc/self/fd/([1-9][0-9]*))(?=
 _PACKED_REF_SEPARATORS = frozenset((ord(" "), ord("\t"), ord("\r")))
 _PACKED_REF_FORBIDDEN = frozenset(b" ~^:?*[\\")
 _PACKED_REFS_HEADER = b"# pack-refs with:"
-_COMMIT_MESSAGE = b"RepoGuard safe repair candidate\n"
-_IDENTITY = "RepoGuard <repoguard@localhost>"
+_COMMIT_MESSAGE = REPAIR_PUBLICATION_COMMIT_MESSAGE.encode("ascii")
+_IDENTITY = f"{REPAIR_PUBLICATION_AUTHOR_NAME} <{REPAIR_PUBLICATION_AUTHOR_EMAIL}>"
 _MINIMUM_FREE_BYTES = 4 * 1_024 * 1_024 * 1_024
 _MAX_HEAD_ENTRIES = 20_000
 _MAX_HEAD_BLOB_BYTES = 512 * 1_024 * 1_024
@@ -132,6 +141,17 @@ class _MaterializedFile:
     path: str
     content: bytes
     executable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationManifestObjects:
+    source: _RepositoryIdentity
+    ref: str
+    parent_oid: str
+    tree_oid: str
+    commit_oid: str
+    entries: tuple[_HeadEntry, ...]
+    total_blob_bytes: int
 
 
 class _PublicationOutcome(StrEnum):
@@ -346,6 +366,258 @@ def _read_head_file(
     if len(result.stdout) != entry.size:
         _raise(RepairErrorCode.MISSING_OBJECT, RepairStage.INPUT)
     return result.stdout
+
+
+def _inspect_repair_publication(
+    repository: RepositoryInput,
+    git_executable: Path,
+    *,
+    candidate_id: str,
+    expected_tree_oid: str,
+    expected_commit_oid: str,
+    expected_changed_paths: tuple[str, ...],
+) -> _PublicationManifestObjects:
+    """Reconstruct and verify one applied repair solely from source Git objects."""
+    if type(repository) is not RepositoryInput:
+        raise TypeError("repository must be an exact RepositoryInput")
+    _require_git_executable(git_executable)
+    if type(candidate_id) is not str or _CANDIDATE_ID_PATTERN.fullmatch(candidate_id) is None:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    invalid_paths = False
+    try:
+        canonical_paths = _canonical_repository_paths(
+            expected_changed_paths,
+            "expected_changed_paths",
+            minimum=1,
+            maximum=_MAX_CHANGED_PATHS,
+        )
+    except (TypeError, ValueError):
+        invalid_paths = True
+        canonical_paths = ()
+    if invalid_paths or canonical_paths != expected_changed_paths:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+
+    layout = _resolve_repository_layout(repository, git_executable)
+    object_format = _read_ascii_line(
+        _run_required(
+            git_executable,
+            layout.root,
+            ("rev-parse", "--show-object-format"),
+            stage=RepairStage.APPLICATION,
+            failure_code=RepairErrorCode.PUBLICATION_FAILED,
+        ).stdout,
+        RepairStage.APPLICATION,
+    )
+    if object_format not in _OBJECT_FORMAT_LENGTHS:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    _require_oid(expected_tree_oid, object_format, RepairStage.APPLICATION)
+    _require_oid(expected_commit_oid, object_format, RepairStage.APPLICATION)
+    parent_oid = _read_fixed_repair_parent(
+        git_executable,
+        layout.root,
+        object_format,
+        expected_tree_oid,
+        expected_commit_oid,
+    )
+    source = _capture_repository(repository, git_executable, head_oid=parent_oid)
+    if source.root != layout.root or source.common_dir != layout.common_dir:
+        _raise(RepairErrorCode.IDENTITY_MISMATCH, RepairStage.APPLICATION)
+    _verify_commit(
+        git_executable,
+        source.root,
+        source,
+        expected_tree_oid,
+        expected_commit_oid,
+        stage=RepairStage.APPLICATION,
+        failure_code=RepairErrorCode.PUBLICATION_FAILED,
+    )
+    actual_changed_paths = _read_publication_changed_paths(
+        git_executable,
+        source,
+        expected_commit_oid,
+    )
+    if actual_changed_paths != expected_changed_paths:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    tree_entries, _, object_oids = _read_head_entries(
+        git_executable,
+        source.root,
+        source.object_format,
+        expected_commit_oid,
+        stage=RepairStage.APPLICATION,
+        limits=_DEFAULT_LIMITS,
+    )
+    if not object_oids or object_oids[0] != expected_tree_oid:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    changed_entries: list[_HeadEntry] = []
+    total_blob_bytes = 0
+    for path in expected_changed_paths:
+        entry = _entry_for_path(tree_entries, path)
+        if (
+            entry is None
+            or entry.kind != "blob"
+            or entry.mode not in {"100644", "100755"}
+            or entry.size is None
+        ):
+            _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+        changed_entries.append(entry)
+        total_blob_bytes += entry.size
+    current = _read_repair_ref(
+        source,
+        git_executable,
+        candidate_id,
+        expected_commit_oid=expected_commit_oid,
+    )
+    if current != expected_commit_oid:
+        _raise(RepairErrorCode.REF_CONFLICT, RepairStage.APPLICATION)
+    _revalidate_source(source, git_executable, RepairStage.APPLICATION)
+    return _PublicationManifestObjects(
+        source=source,
+        ref=_repair_ref(candidate_id),
+        parent_oid=parent_oid,
+        tree_oid=expected_tree_oid,
+        commit_oid=expected_commit_oid,
+        entries=tuple(changed_entries),
+        total_blob_bytes=total_blob_bytes,
+    )
+
+
+def _read_repair_publication_blob(
+    publication: _PublicationManifestObjects,
+    git_executable: Path,
+    *,
+    path: str,
+    mode: str,
+    blob_oid: str,
+    size: int,
+) -> bytes:
+    """Read and independently hash one exact entry from a verified publication."""
+    if type(publication) is not _PublicationManifestObjects:
+        raise TypeError("publication must be an exact _PublicationManifestObjects")
+    _require_git_executable(git_executable)
+    expected = _entry_for_path(publication.entries, path)
+    if (
+        expected is None
+        or expected.mode != mode
+        or expected.oid != blob_oid
+        or expected.size != size
+        or expected.kind != "blob"
+        or size < 0
+        or size > publication.total_blob_bytes
+    ):
+        _raise(RepairErrorCode.IDENTITY_MISMATCH, RepairStage.APPLICATION)
+    _revalidate_source(publication.source, git_executable, RepairStage.APPLICATION)
+    current = _read_repair_ref(
+        publication.source,
+        git_executable,
+        publication.ref.removeprefix("refs/repoguard/repairs/"),
+        expected_commit_oid=publication.commit_oid,
+    )
+    if current != publication.commit_oid:
+        _raise(RepairErrorCode.REF_CONFLICT, RepairStage.APPLICATION)
+    result = _run_required(
+        git_executable,
+        publication.source.root,
+        ("cat-file", "blob", blob_oid),
+        stage=RepairStage.APPLICATION,
+        failure_code=RepairErrorCode.MISSING_OBJECT,
+        stdout_limit=size + 1,
+    )
+    content = result.stdout
+    if len(content) != size:
+        _raise(RepairErrorCode.MISSING_OBJECT, RepairStage.APPLICATION)
+    header = f"blob {size}\0".encode("ascii")
+    actual_oid = hashlib.new(publication.source.object_format, header + content).hexdigest()
+    if not hmac.compare_digest(actual_oid, blob_oid):
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    _revalidate_source(publication.source, git_executable, RepairStage.APPLICATION)
+    current = _read_repair_ref(
+        publication.source,
+        git_executable,
+        publication.ref.removeprefix("refs/repoguard/repairs/"),
+        expected_commit_oid=publication.commit_oid,
+    )
+    if current != publication.commit_oid:
+        _raise(RepairErrorCode.REF_CONFLICT, RepairStage.APPLICATION)
+    return content
+
+
+def _read_fixed_repair_parent(
+    git_executable: Path,
+    root: Path,
+    object_format: str,
+    tree_oid: str,
+    commit_oid: str,
+) -> str:
+    result = _run_required(
+        git_executable,
+        root,
+        ("cat-file", "commit", commit_oid),
+        stage=RepairStage.APPLICATION,
+        failure_code=RepairErrorCode.MISSING_OBJECT,
+    )
+    prefix = f"tree {tree_oid}\nparent ".encode("ascii")
+    suffix = (f"\nauthor {_IDENTITY} 0 +0000\ncommitter {_IDENTITY} 0 +0000\n\n").encode(
+        "ascii"
+    ) + _COMMIT_MESSAGE
+    oid_length = _OBJECT_FORMAT_LENGTHS[object_format]
+    raw_parent = result.stdout[len(prefix) : len(prefix) + oid_length]
+    invalid = not result.stdout.startswith(prefix) or result.stdout != prefix + raw_parent + suffix
+    parent_oid = ""
+    try:
+        parent_oid = raw_parent.decode("ascii")
+    except UnicodeDecodeError:
+        invalid = True
+    if invalid:
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    _require_oid(parent_oid, object_format, RepairStage.APPLICATION)
+    return parent_oid
+
+
+def _read_publication_changed_paths(
+    git_executable: Path,
+    source: _RepositoryIdentity,
+    commit_oid: str,
+) -> tuple[str, ...]:
+    result = _run_required(
+        git_executable,
+        source.root,
+        (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-ext-diff",
+            "--no-renames",
+            "-r",
+            "-z",
+            source.head_oid,
+            commit_oid,
+            "--",
+        ),
+        stage=RepairStage.APPLICATION,
+        failure_code=RepairErrorCode.PUBLICATION_FAILED,
+        stdout_limit=_CONTROL_OUTPUT_BYTES,
+    )
+    records = result.stdout.split(b"\0")
+    if not records or records[-1] != b"":
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    paths: list[str] = []
+    for raw_path in records[:-1]:
+        if len(paths) >= _MAX_CHANGED_PATHS:
+            _raise(RepairErrorCode.RESOURCE_LIMIT, RepairStage.APPLICATION)
+        invalid_path = False
+        path = ""
+        try:
+            path = raw_path.decode("utf-8")
+            _validate_repository_path(path)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            invalid_path = True
+        if invalid_path:
+            _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+        paths.append(path)
+    canonical = tuple(sorted(paths, key=str.encode))
+    if not canonical or len(set(canonical)) != len(canonical):
+        _raise(RepairErrorCode.PUBLICATION_FAILED, RepairStage.APPLICATION)
+    return canonical
 
 
 def _materialize_candidate(
@@ -2290,11 +2562,11 @@ def _write_commit(
 ) -> str:
     environment = {
         **index_environment,
-        "GIT_AUTHOR_NAME": "RepoGuard",
-        "GIT_AUTHOR_EMAIL": "repoguard@localhost",
+        "GIT_AUTHOR_NAME": REPAIR_PUBLICATION_AUTHOR_NAME,
+        "GIT_AUTHOR_EMAIL": REPAIR_PUBLICATION_AUTHOR_EMAIL,
         "GIT_AUTHOR_DATE": "@0 +0000",
-        "GIT_COMMITTER_NAME": "RepoGuard",
-        "GIT_COMMITTER_EMAIL": "repoguard@localhost",
+        "GIT_COMMITTER_NAME": REPAIR_PUBLICATION_AUTHOR_NAME,
+        "GIT_COMMITTER_EMAIL": REPAIR_PUBLICATION_AUTHOR_EMAIL,
         "GIT_COMMITTER_DATE": "@0 +0000",
     }
     result = _run_required(

@@ -607,6 +607,7 @@ def build_context_index(
     *,
     embedding_provider: EmbeddingProvider,
     config: ContextIndexConfig = _DEFAULT_CONTEXT_INDEX_CONFIG,
+    git_executable: Path | None = None,
 ) -> ContextIndex:
     """Build one atomic in-memory index over an immutable committed head tree."""
     from repoguard._retrieval import _build_context_index
@@ -615,6 +616,7 @@ def build_context_index(
         bundle,
         embedding_provider=embedding_provider,
         config=config,
+        git_executable=git_executable,
     )
 
 

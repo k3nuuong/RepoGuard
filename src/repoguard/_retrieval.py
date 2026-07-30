@@ -14,6 +14,7 @@ import os
 import re
 import selectors
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -394,6 +395,7 @@ def _build_context_index(
     *,
     embedding_provider: EmbeddingProvider,
     config: ContextIndexConfig,
+    git_executable: Path | None = None,
 ) -> ContextIndex:
     """Detach every implementation failure at the public private boundary."""
     failure: RetrievalError | None = None
@@ -402,6 +404,7 @@ def _build_context_index(
             bundle,
             embedding_provider=embedding_provider,
             config=config,
+            git_executable=git_executable,
         )
     except RetrievalError as error:
         failure = _detached_failure(error, fallback_stage=RetrievalStage.VALIDATE)
@@ -416,11 +419,13 @@ def _build_context_index_impl(
     *,
     embedding_provider: EmbeddingProvider,
     config: ContextIndexConfig,
+    git_executable: Path | None,
 ) -> ContextIndex:
     """Build and atomically publish one concrete context index."""
     _validate_evidence(bundle)
     assert isinstance(bundle, EvidenceBundle)
     normalized_config = _validate_configuration(config)
+    executable = _validate_git_executable(git_executable)
     provider = _validate_provider_shape(embedding_provider)
     deadline = time.monotonic() + normalized_config.build_timeout_seconds
     token = object()
@@ -434,6 +439,7 @@ def _build_context_index_impl(
             bundle,
             normalized_config,
             deadline,
+            git_executable=executable,
         )
         _initialize_provider(provider, bundle.repository.root, deadline)
         provider_name, actual_device = _validate_initialized_provider(provider)
@@ -964,6 +970,8 @@ def _read_committed_corpus(
     bundle: EvidenceBundle,
     config: ContextIndexConfig,
     deadline: float,
+    *,
+    git_executable: str,
 ) -> tuple[tuple[_CorpusFile, ...], int]:
     root = bundle.repository.root
     oid_length = _OID_LENGTHS[bundle.repository.object_format]
@@ -972,12 +980,14 @@ def _read_committed_corpus(
         ("rev-parse", "--show-toplevel"),
         deadline=deadline,
         stage=RetrievalStage.READ_CORPUS,
+        git_executable=git_executable,
     )
     actual_format = _run_git(
         root,
         ("rev-parse", "--show-object-format"),
         deadline=deadline,
         stage=RetrievalStage.READ_CORPUS,
+        git_executable=git_executable,
     )
     root_failed = False
     try:
@@ -991,7 +1001,12 @@ def _read_committed_corpus(
     if root_failed or resolved != root or format_text != bundle.repository.object_format:
         _fail(RetrievalErrorCode.INVALID_EVIDENCE, RetrievalStage.READ_CORPUS)
 
-    _verify_head_commit(root, bundle.revisions.head_oid, deadline)
+    _verify_head_commit(
+        root,
+        bundle.revisions.head_oid,
+        deadline,
+        git_executable=git_executable,
+    )
     tree = _run_git(
         root,
         ("ls-tree", "-r", "-z", "--full-tree", bundle.revisions.head_oid),
@@ -1000,6 +1015,7 @@ def _read_committed_corpus(
         missing_is_object=True,
         stdout_limit=_GIT_TREE_OUTPUT_BYTES,
         output_limit_code=RetrievalErrorCode.INDEX_LIMIT_EXCEEDED,
+        git_executable=git_executable,
     )
     entries = _parse_tree(tree, oid_length)
     selected: list[_TreeEntry] = []
@@ -1022,12 +1038,17 @@ def _read_committed_corpus(
         selected,
         config=config,
         deadline=deadline,
+        git_executable=git_executable,
     )
     return corpus, excluded_count + content_exclusions
 
 
 def _git_environment() -> dict[str, str]:
-    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("GIT_", "REPOGUARD_"))
+    }
     environment.update(
         {
             "GIT_ATTR_GLOBAL": os.devnull,
@@ -1047,9 +1068,42 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
-def _git_command(root: Path, args: Sequence[str]) -> list[str]:
+def _validate_git_executable(path: Path | None) -> str:
+    if path is None:
+        return "git"
+    if not isinstance(path, Path) or not path.is_absolute():
+        _fail(RetrievalErrorCode.INVALID_CONFIGURATION, RetrievalStage.VALIDATE)
+    try:
+        rendered = str(path)
+        rendered.encode("utf-8", "strict")
+        if Path(os.path.normpath(rendered)) != path:
+            raise ValueError
+        current = Path(path.anchor)
+        metadata = os.lstat(current)
+        for part in path.parts[1:]:
+            current /= part
+            metadata = os.lstat(current)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError
+    except (OSError, UnicodeEncodeError, ValueError):
+        _fail(RetrievalErrorCode.INVALID_CONFIGURATION, RetrievalStage.VALIDATE)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o111 == 0
+    ):
+        _fail(RetrievalErrorCode.INVALID_CONFIGURATION, RetrievalStage.VALIDATE)
+    return rendered
+
+
+def _git_command(
+    root: Path,
+    args: Sequence[str],
+    *,
+    git_executable: str = "git",
+) -> list[str]:
     return [
-        "git",
+        git_executable,
         "--literal-pathspecs",
         "-c",
         f"core.attributesFile={os.devnull}",
@@ -1076,6 +1130,7 @@ def _run_git(
     missing_is_object: bool = False,
     stdout_limit: int = _GIT_CONTROL_OUTPUT_BYTES,
     output_limit_code: RetrievalErrorCode = RetrievalErrorCode.READ_FAILED,
+    git_executable: str = "git",
 ) -> bytes:
     _check_deadline(deadline, stage)
     if type(stdout_limit) is not int or stdout_limit <= 0:
@@ -1085,7 +1140,7 @@ def _run_git(
     process: subprocess.Popen[bytes] | None = None
     try:
         process = subprocess.Popen(
-            _git_command(root, args),
+            _git_command(root, args, git_executable=git_executable),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1185,13 +1240,20 @@ def _single_git_line(value: bytes) -> bytes:
     return lines[0]
 
 
-def _verify_head_commit(root: Path, oid: str, deadline: float) -> None:
+def _verify_head_commit(
+    root: Path,
+    oid: str,
+    deadline: float,
+    *,
+    git_executable: str,
+) -> None:
     object_type = _run_git(
         root,
         ("cat-file", "-t", oid),
         deadline=deadline,
         stage=RetrievalStage.READ_CORPUS,
         missing_is_object=True,
+        git_executable=git_executable,
     )
     try:
         kind = _single_git_line(object_type).decode("ascii", "strict")
@@ -1252,12 +1314,18 @@ def _path_selected(path: str, config: ContextIndexConfig) -> bool:
 
 def _start_cat_file(
     root: Path,
+    *,
+    git_executable: str = "git",
 ) -> subprocess.Popen[bytes]:
     unavailable = False
     start_failed = False
     try:
         process = subprocess.Popen(
-            _git_command(root, ("cat-file", "--batch")),
+            _git_command(
+                root,
+                ("cat-file", "--batch"),
+                git_executable=git_executable,
+            ),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1283,10 +1351,15 @@ def _read_blobs(
     *,
     config: ContextIndexConfig,
     deadline: float,
+    git_executable: str,
 ) -> tuple[tuple[_CorpusFile, ...], int]:
     if not entries:
         return (), 0
-    process = _start_cat_file(root)
+    process = (
+        _start_cat_file(root)
+        if git_executable == "git"
+        else _start_cat_file(root, git_executable=git_executable)
+    )
     stdin = cast(BinaryIO | None, process.stdin)
     stdout = cast(BinaryIO | None, process.stdout)
     if stdin is None or stdout is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +16,7 @@ __all__ = [
     "DiffLineKind",
     "EvidenceBundle",
     "EvidenceCollectionError",
+    "EvidenceCollectionLimits",
     "EvidenceErrorCode",
     "FileChangeEvidence",
     "FileVersion",
@@ -68,7 +70,9 @@ class EvidenceErrorCode(StrEnum):
     AMBIGUOUS_MERGE_BASE = "ambiguous_merge_base"
     UNSUPPORTED_PATH_ENCODING = "unsupported_path_encoding"
     GIT_COMMAND_FAILED = "git_command_failed"
+    GIT_TIMEOUT = "git_timeout"
     MALFORMED_GIT_OUTPUT = "malformed_git_output"
+    RESOURCE_LIMIT = "resource_limit"
 
 
 class EvidenceCollectionError(RuntimeError):
@@ -79,6 +83,36 @@ class EvidenceCollectionError(RuntimeError):
     def __init__(self, code: EvidenceErrorCode, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCollectionLimits:
+    """Caller-lowerable resource ceilings for one atomic evidence collection."""
+
+    max_changed_files: int = 1_000
+    max_blob_bytes: int = 2 * 1024 * 1024
+    max_total_blob_bytes: int = 64 * 1024 * 1024
+    max_diff_bytes: int = 16 * 1024 * 1024
+    max_diff_lines: int = 131_072
+    git_timeout_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        ceilings = {
+            "max_changed_files": 1_000,
+            "max_blob_bytes": 2 * 1024 * 1024,
+            "max_total_blob_bytes": 64 * 1024 * 1024,
+            "max_diff_bytes": 16 * 1024 * 1024,
+            "max_diff_lines": 131_072,
+        }
+        for name, ceiling in ceilings.items():
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= ceiling:
+                raise ValueError(f"{name} must be an integer from 1 through {ceiling}")
+        timeout = self.git_timeout_seconds
+        if type(timeout) is not float or not math.isfinite(timeout) or not 0.0 < timeout <= 60.0:
+            raise ValueError(
+                "git_timeout_seconds must be a finite float greater than 0 and at most 60"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,11 +210,29 @@ class EvidenceBundle:
 def collect_evidence(
     repository: RepositoryInput,
     pull_request: PullRequestInput,
+    *,
+    limits: EvidenceCollectionLimits | None = None,
+    git_executable: Path | None = None,
 ) -> EvidenceBundle:
-    """Collect deterministic evidence from committed objects in a local worktree."""
+    """Collect committed evidence, optionally using one bounded fixed-Git capability."""
     from repoguard._git import _collect_evidence
 
-    return _collect_evidence(repository, pull_request)
+    if limits is not None and type(limits) is not EvidenceCollectionLimits:
+        raise TypeError("limits must be an exact EvidenceCollectionLimits or None")
+    if git_executable is not None and not isinstance(git_executable, Path):
+        raise TypeError("git_executable must be a Path or None")
+    if git_executable is not None and limits is None:
+        raise ValueError("git_executable requires explicit evidence collection limits")
+    if limits is None:
+        return _collect_evidence(repository, pull_request)
+    if git_executable is not None:
+        return _collect_evidence(
+            repository,
+            pull_request,
+            limits=limits,
+            git_executable=git_executable,
+        )
+    return _collect_evidence(repository, pull_request, limits=limits)
 
 
 def evidence_to_dict(bundle: EvidenceBundle) -> dict[str, object]:

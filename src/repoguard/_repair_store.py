@@ -515,7 +515,15 @@ class _SessionPathGuard:
 
 
 class _SessionStore:
-    __slots__ = ("_config", "_events_fd", "_lock_fd", "_private_fd", "_session_fd", "session_id")
+    __slots__ = (
+        "_config",
+        "_events_fd",
+        "_lock_fd",
+        "_private_fd",
+        "_read_only",
+        "_session_fd",
+        "session_id",
+    )
 
     def __init__(
         self,
@@ -525,13 +533,18 @@ class _SessionStore:
         events_fd: int,
         private_fd: int | None,
         lock_fd: int,
+        *,
+        read_only: bool = False,
     ) -> None:
+        if type(read_only) is not bool:
+            raise TypeError("read_only must be a bool")
         self._config = config
         self.session_id = session_id
         self._session_fd = session_fd
         self._events_fd = events_fd
         self._private_fd = private_fd
         self._lock_fd = lock_fd
+        self._read_only = read_only
 
     def close(self) -> None:
         fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
@@ -566,7 +579,7 @@ class _SessionStore:
         if invalid_chain or loaded is None:
             _raise_corrupt(self.session_id)
         cached = _read_cache(self._session_fd)
-        if cached != _cache_mapping(loaded):
+        if not self._read_only and cached != _cache_mapping(loaded):
             _write_atomic(self._session_fd, "state.json", _canonical_bytes(_cache_mapping(loaded)))
         return loaded
 
@@ -578,6 +591,7 @@ class _SessionStore:
         validation_run: _ValidationRunLease | None = None,
         clear_validation_run: bool = False,
     ) -> _LoadedState:
+        self._require_writable()
         if type(kind) is not str or kind not in _EVENT_KINDS:
             raise ValueError("event kind is invalid")
         if type(snapshot) is not RepairSnapshot or snapshot.session_id != self.session_id:
@@ -671,6 +685,7 @@ class _SessionStore:
         return loaded
 
     def write_private_json(self, name: str, value: Mapping[str, object]) -> None:
+        self._require_writable()
         private_fd = self._require_private_fd()
         _validate_payload_name(name)
         _write_immutable(private_fd, name, _canonical_bytes(value))
@@ -681,6 +696,7 @@ class _SessionStore:
         return _read_canonical_mapping(private_fd, name, _MAX_RECORD_BYTES, immutable=True)
 
     def write_private_bytes(self, name: str, value: bytes) -> None:
+        self._require_writable()
         private_fd = self._require_private_fd()
         _validate_payload_name(name)
         if type(value) is not bytes or len(value) > _MAX_RECORD_BYTES:
@@ -693,6 +709,7 @@ class _SessionStore:
         return _read_file(private_fd, name, maximum, immutable=True)
 
     def write_preview(self, value: Mapping[str, object]) -> None:
+        self._require_writable()
         _write_immutable(self._session_fd, "preview.json", _canonical_bytes(value))
 
     def read_preview(self) -> dict[str, object]:
@@ -708,6 +725,7 @@ class _SessionStore:
         return value
 
     def cleanup_private(self) -> bool:
+        self._require_writable()
         if self._private_fd is None:
             try:
                 os.stat("private", dir_fd=self._session_fd, follow_symlinks=False)
@@ -752,6 +770,10 @@ class _SessionStore:
         except (_UnsafeRemoval, OSError):
             pass
         return removed
+
+    def _require_writable(self) -> None:
+        if self._read_only:
+            raise ValueError("repair session store is read-only")
 
     def _require_private_fd(self) -> int:
         if self._private_fd is None:
@@ -808,6 +830,50 @@ def _initialize_runtime_root(
             os.close(root_fd)
     if invalid or runtime_root_identity is None:
         _raise_store_error(RepairErrorCode.INVALID_CONFIG, RepairStage.INPUT, None, None)
+    return runtime_root_identity
+
+
+def _open_existing_runtime_root(
+    config: RepairManagerConfig,
+    *,
+    repository_root: Path,
+    common_dir: Path,
+    session_id: str,
+) -> _RuntimeRootIdentity:
+    """Validate an existing runtime root without creating or repairing any entry."""
+    _validate_session_id(session_id)
+    _validate_host_inputs(config)
+    _require_no_symlink_ancestors(config.runtime_root)
+    root_fd: int | None = None
+    sessions_fd: int | None = None
+    failure: tuple[RepairErrorCode, RepairStage] | None = None
+    runtime_root_identity: _RuntimeRootIdentity | None = None
+    try:
+        _require_disjoint(config.runtime_root, repository_root)
+        _require_disjoint(config.runtime_root, common_dir)
+        root_fd = _open_directory(config.runtime_root)
+        sessions_fd = os.open(
+            "sessions",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        _validate_fd(sessions_fd, directory=True, mode=0o700)
+        runtime_root_identity = _runtime_root_identity(root_fd)
+    except FileNotFoundError:
+        failure = (RepairErrorCode.SESSION_NOT_FOUND, RepairStage.SESSION)
+    except RepairError:
+        raise
+    except OSError:
+        failure = (RepairErrorCode.SESSION_CORRUPT, RepairStage.PERSISTENCE)
+    finally:
+        if sessions_fd is not None:
+            os.close(sessions_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+    if failure is not None:
+        _raise_store_error(failure[0], failure[1], None, session_id)
+    if runtime_root_identity is None:
+        raise AssertionError("repair runtime root identity is missing")
     return runtime_root_identity
 
 
@@ -916,9 +982,12 @@ def _locked_session(
     *,
     runtime_root_identity: _RuntimeRootIdentity | None = None,
     private_identity: _RuntimeRootIdentity | None = None,
+    read_only: bool = False,
 ) -> Iterator[_SessionStore]:
     _validate_session_id(session_id)
     _validate_runtime_root_identity(private_identity)
+    if type(read_only) is not bool:
+        raise TypeError("read_only must be a bool")
     root_fd: int | None = None
     session_fd: int | None = None
     events_fd: int | None = None
@@ -960,9 +1029,22 @@ def _locked_session(
             if private_identity is not None:
                 raise OSError("repair private directory identity changed") from None
             private_fd = None
-        lock_fd = os.open("session.lock", os.O_RDWR | os.O_NOFOLLOW, dir_fd=session_fd)
+        lock_fd = os.open(
+            "session.lock",
+            (os.O_RDONLY if read_only else os.O_RDWR) | os.O_NOFOLLOW,
+            dir_fd=session_fd,
+        )
         _validate_fd(lock_fd, directory=False, mode=0o600)
-        if not _acquire_flock(lock_fd, config.lock_timeout_seconds):
+        acquired = (
+            _acquire_flock(
+                lock_fd,
+                config.lock_timeout_seconds,
+                shared=True,
+            )
+            if read_only
+            else _acquire_flock(lock_fd, config.lock_timeout_seconds)
+        )
+        if not acquired:
             _raise_store_error(
                 RepairErrorCode.SESSION_LOCKED,
                 RepairStage.SESSION,
@@ -988,6 +1070,7 @@ def _locked_session(
             events_fd,
             private_fd,
             lock_fd,
+            read_only=read_only,
         )
         session_fd = events_fd = private_fd = lock_fd = None
         try:
@@ -2623,11 +2706,19 @@ def _ensure_lock_file(directory_fd: int, name: str) -> None:
     _fsync(directory_fd)
 
 
-def _acquire_flock(descriptor: int, timeout_seconds: float) -> bool:
+def _acquire_flock(
+    descriptor: int,
+    timeout_seconds: float,
+    *,
+    shared: bool = False,
+) -> bool:
+    if type(shared) is not bool:
+        raise TypeError("shared must be a bool")
+    operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     deadline = time.monotonic() + timeout_seconds
     while True:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
             return True
         except BlockingIOError:
             if time.monotonic() >= deadline:

@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import stat
 import subprocess
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Never
+from typing import BinaryIO, Never
 
 from repoguard.evidence import (
     ChangeType,
@@ -19,6 +23,7 @@ from repoguard.evidence import (
     DiffLineKind,
     EvidenceBundle,
     EvidenceCollectionError,
+    EvidenceCollectionLimits,
     EvidenceErrorCode,
     FileChangeEvidence,
     FileVersion,
@@ -36,6 +41,11 @@ _HUNK_PATTERN = re.compile(
 _NO_NEWLINE_MARKER = b"\\ No newline at end of file\n"
 _OBJECT_FORMAT_LENGTHS = {"sha1": 40, "sha256": 64}
 _GIT_FACADE_ROOT = Path(__file__).with_name("_git_facades")
+_CONTROL_OUTPUT_BYTES = 1024 * 1024
+_RAW_CHANGE_OUTPUT_BYTES = 16 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
+_POLL_SECONDS = 0.01
+_PROCESS_CLEANUP_SECONDS = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,33 +60,370 @@ class _RawChange:
     new_path: str
 
 
+@dataclass(slots=True)
+class _CollectionBudget:
+    limits: EvidenceCollectionLimits
+    deadline: float
+    git_executable: str = "git"
+    blob_bytes: int = 0
+    diff_bytes: int = 0
+    diff_lines: int = 0
+
+
+@dataclass(slots=True)
+class _DrainState:
+    output: bytearray
+    total: int = 0
+    overflowed: bool = False
+    error: Exception | None = None
+
+
+def _validate_git_executable(path: Path) -> str:
+    if not path.is_absolute():
+        raise ValueError("git_executable must be an absolute regular executable")
+    try:
+        str(path).encode("utf-8", "strict")
+        current = Path(path.anchor)
+        metadata = os.lstat(current)
+        for part in path.parts[1:]:
+            current /= part
+            metadata = os.lstat(current)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("git_executable cannot contain symbolic links")
+    except (OSError, UnicodeEncodeError, ValueError) as error:
+        raise ValueError("git_executable is invalid") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o111 == 0
+    ):
+        raise ValueError("git_executable is invalid")
+    return str(path)
+
+
+def _check_deadline(budget: _CollectionBudget | None) -> None:
+    if budget is not None and time.monotonic() >= budget.deadline:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_TIMEOUT,
+            "Git evidence collection exceeded its shared timeout",
+        )
+
+
+def _parse_blob_size(output: bytes) -> int:
+    encoded_size = _single_output_line(output, "blob size")
+    if not encoded_size.isdigit():
+        _raise_malformed("Git blob size is not an unsigned decimal integer")
+    try:
+        return int(encoded_size)
+    except ValueError as error:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.MALFORMED_GIT_OUTPUT,
+            "Git blob size is too large to parse",
+        ) from error
+
+
+def _reserve_blob_bytes(budget: _CollectionBudget, size: int) -> None:
+    _check_deadline(budget)
+    if size > budget.limits.max_blob_bytes:
+        _raise_resource_limit("per-blob byte limit exceeded")
+    if size > budget.limits.max_total_blob_bytes - budget.blob_bytes:
+        _raise_resource_limit("total blob byte limit exceeded")
+    budget.blob_bytes += size
+
+
+def _reserve_diff_bytes(budget: _CollectionBudget, size: int) -> None:
+    _check_deadline(budget)
+    if size > budget.limits.max_diff_bytes - budget.diff_bytes:
+        _raise_resource_limit("diff byte limit exceeded")
+    budget.diff_bytes += size
+
+
+def _reserve_diff_line(budget: _CollectionBudget) -> None:
+    _check_deadline(budget)
+    if budget.diff_lines >= budget.limits.max_diff_lines:
+        _raise_resource_limit("diff line limit exceeded")
+    budget.diff_lines += 1
+
+
+def _drain_bounded_stream(
+    stream: BinaryIO,
+    limit: int,
+    state: _DrainState,
+    stop_event: threading.Event,
+) -> None:
+    try:
+        file_descriptor = stream.fileno()
+        while not stop_event.is_set():
+            remaining = limit - state.total
+            try:
+                chunk = os.read(file_descriptor, min(_READ_CHUNK_BYTES, remaining + 1))
+            except BlockingIOError:
+                stop_event.wait(_POLL_SECONDS)
+                continue
+            if not chunk:
+                return
+            state.total += len(chunk)
+            retained = min(len(chunk), remaining)
+            state.output.extend(chunk[:retained])
+            if state.total > limit:
+                state.overflowed = True
+                stop_event.set()
+                return
+    except (OSError, ValueError) as error:
+        if not stop_event.is_set():
+            state.error = error
+            stop_event.set()
+    finally:
+        with suppress(OSError):
+            stream.close()
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    if process.poll() is None:
+        with suppress(OSError):
+            process.kill()
+    with suppress(OSError, subprocess.TimeoutExpired):
+        process.wait(timeout=_PROCESS_CLEANUP_SECONDS)
+
+
+def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            with suppress(OSError):
+                stream.close()
+
+
+def _join_threads(threads: Sequence[threading.Thread], failure_message: str) -> None:
+    cleanup_deadline = time.monotonic() + _PROCESS_CLEANUP_SECONDS
+    for thread in threads:
+        remaining = cleanup_deadline - time.monotonic()
+        if remaining > 0:
+            thread.join(remaining)
+    if any(thread.is_alive() for thread in threads):
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            failure_message,
+        )
+
+
+def _invoke_bounded_process(
+    command: Sequence[str],
+    *,
+    environment: Mapping[str, str],
+    cwd: str | None,
+    pass_fds: Sequence[int] = (),
+    budget: _CollectionBudget,
+    stdout_limit: int,
+    stderr_limit: int,
+    stdout_overflow_code: EvidenceErrorCode = EvidenceErrorCode.RESOURCE_LIMIT,
+) -> subprocess.CompletedProcess[bytes]:
+    _check_deadline(budget)
+    if stdout_limit < 0 or stderr_limit < 0:
+        _raise_resource_limit("Git output byte limit exhausted")
+    try:
+        process = subprocess.Popen(
+            list(command),
+            bufsize=0,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            cwd=cwd,
+            env=environment,
+            pass_fds=tuple(pass_fds),
+            start_new_session=True,
+        )
+    except FileNotFoundError as error:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_UNAVAILABLE,
+            "Git executable is not available",
+        ) from error
+    except (OSError, ValueError) as error:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            "Git command could not be started",
+        ) from error
+
+    stdout = process.stdout
+    stderr = process.stderr
+    if stdout is None or stderr is None:
+        _terminate_process_group(process)
+        _close_process_streams(process)
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            "Git output pipes could not be created",
+        )
+    try:
+        os.set_blocking(stdout.fileno(), False)
+        os.set_blocking(stderr.fileno(), False)
+    except (OSError, ValueError) as error:
+        _terminate_process_group(process)
+        _close_process_streams(process)
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            "Git output pipes could not be made non-blocking",
+        ) from error
+
+    stop_event = threading.Event()
+    stdout_state = _DrainState(bytearray())
+    stderr_state = _DrainState(bytearray())
+    drain_threads = (
+        threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stdout, stdout_limit, stdout_state, stop_event),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stderr, stderr_limit, stderr_state, stop_event),
+            daemon=True,
+        ),
+    )
+    started_threads = 0
+    try:
+        for thread in drain_threads:
+            thread.start()
+            started_threads += 1
+    except (OSError, RuntimeError) as error:
+        stop_event.set()
+        _terminate_process_group(process)
+        _close_process_streams(process)
+        _join_threads(
+            drain_threads[:started_threads],
+            "Git output reader threads did not stop",
+        )
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            "Git output reader threads could not be started",
+        ) from error
+
+    failure: EvidenceErrorCode | None = None
+    while True:
+        if stdout_state.overflowed:
+            failure = stdout_overflow_code
+            break
+        if stderr_state.overflowed:
+            failure = EvidenceErrorCode.RESOURCE_LIMIT
+            break
+        if stdout_state.error is not None or stderr_state.error is not None:
+            failure = EvidenceErrorCode.GIT_COMMAND_FAILED
+            break
+        remaining = budget.deadline - time.monotonic()
+        if remaining <= 0:
+            failure = EvidenceErrorCode.GIT_TIMEOUT
+            break
+        if process.poll() is not None and not any(thread.is_alive() for thread in drain_threads):
+            break
+        stop_event.wait(min(_POLL_SECONDS, remaining))
+
+    if failure is not None:
+        stop_event.set()
+        _terminate_process_group(process)
+        _close_process_streams(process)
+        return_code = process.returncode if process.returncode is not None else -signal.SIGKILL
+    else:
+        return_code = process.returncode
+        if return_code is None:
+            raise EvidenceCollectionError(
+                EvidenceErrorCode.GIT_COMMAND_FAILED,
+                "Git process completion could not be observed",
+            )
+    _join_threads(drain_threads, "Git output reader threads did not stop")
+    _close_process_streams(process)
+
+    if failure is EvidenceErrorCode.RESOURCE_LIMIT:
+        _raise_resource_limit("Git command output byte limit exceeded")
+    if failure is EvidenceErrorCode.GIT_TIMEOUT:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_TIMEOUT,
+            "Git evidence collection exceeded its shared timeout",
+        )
+    if failure is EvidenceErrorCode.GIT_COMMAND_FAILED:
+        raise EvidenceCollectionError(
+            EvidenceErrorCode.GIT_COMMAND_FAILED,
+            "Git command output could not be read",
+        )
+    if failure is EvidenceErrorCode.MALFORMED_GIT_OUTPUT:
+        _raise_malformed("Git command stdout exceeded its declared byte size")
+    completed = subprocess.CompletedProcess(
+        list(command),
+        return_code,
+        stdout=bytes(stdout_state.output),
+        stderr=bytes(stderr_state.output),
+    )
+    _check_deadline(budget)
+    return completed
+
+
 def _collect_evidence(
     repository: RepositoryInput,
     pull_request: PullRequestInput,
+    *,
+    limits: EvidenceCollectionLimits | None = None,
+    git_executable: Path | None = None,
 ) -> EvidenceBundle:
-    root = _resolve_worktree(repository.path)
-    object_format = _read_object_format(root)
-    object_directory = _read_object_directory(root)
+    if limits is not None and type(limits) is not EvidenceCollectionLimits:
+        raise TypeError("limits must be an exact EvidenceCollectionLimits or None")
+    if git_executable is not None and not isinstance(git_executable, Path):
+        raise TypeError("git_executable must be a Path or None")
+    if git_executable is not None and limits is None:
+        raise ValueError("git_executable requires explicit evidence collection limits")
+    executable = "git" if git_executable is None else _validate_git_executable(git_executable)
+    validated_limits = (
+        None
+        if limits is None
+        else EvidenceCollectionLimits(
+            max_changed_files=limits.max_changed_files,
+            max_blob_bytes=limits.max_blob_bytes,
+            max_total_blob_bytes=limits.max_total_blob_bytes,
+            max_diff_bytes=limits.max_diff_bytes,
+            max_diff_lines=limits.max_diff_lines,
+            git_timeout_seconds=limits.git_timeout_seconds,
+        )
+    )
+    budget = (
+        None
+        if validated_limits is None
+        else _CollectionBudget(
+            validated_limits,
+            time.monotonic() + validated_limits.git_timeout_seconds,
+            executable,
+        )
+    )
+    root = _resolve_worktree(repository.path, _budget=budget)
+    object_format = _read_object_format(root, _budget=budget)
+    object_directory = _read_object_directory(root, _budget=budget)
     oid_length = _OBJECT_FORMAT_LENGTHS[object_format]
     base_oid = _resolve_ref(
         root,
         pull_request.base_ref,
         EvidenceErrorCode.INVALID_BASE_REF,
         oid_length,
+        _budget=budget,
     )
     head_oid = _resolve_ref(
         root,
         pull_request.head_ref,
         EvidenceErrorCode.INVALID_HEAD_REF,
         oid_length,
+        _budget=budget,
     )
-    merge_base_oid = _resolve_merge_base(root, base_oid, head_oid, oid_length)
+    merge_base_oid = _resolve_merge_base(
+        root,
+        base_oid,
+        head_oid,
+        oid_length,
+        _budget=budget,
+    )
     raw_changes = _read_raw_changes(
         object_format,
         object_directory,
         merge_base_oid,
         head_oid,
         oid_length,
+        _budget=budget,
     )
     content_cache: dict[tuple[str, str], tuple[ContentKind, bytes | None]] = {}
     changes = tuple(
@@ -86,12 +433,14 @@ def _collect_evidence(
                     root,
                     raw_change,
                     content_cache,
+                    _budget=budget,
                 )
                 for raw_change in raw_changes
             ),
             key=_change_sort_key,
         )
     )
+    _check_deadline(budget)
     return EvidenceBundle(
         repository=RepositoryEvidence(root=root, object_format=object_format),
         revisions=RevisionEvidence(
@@ -105,7 +454,8 @@ def _collect_evidence(
     )
 
 
-def _resolve_worktree(path: Path) -> Path:
+def _resolve_worktree(path: Path, *, _budget: _CollectionBudget | None = None) -> Path:
+    _check_deadline(_budget)
     try:
         if not path.exists() or not path.is_dir():
             raise EvidenceCollectionError(
@@ -121,7 +471,12 @@ def _resolve_worktree(path: Path) -> Path:
             f"repository path cannot be resolved: {path}",
         ) from error
 
-    completed = _invoke_git(candidate, ("rev-parse", "--show-toplevel"))
+    completed = _invoke_git_with_budget(
+        candidate,
+        ("rev-parse", "--show-toplevel"),
+        budget=_budget,
+        stdout_limit=_CONTROL_OUTPUT_BYTES,
+    )
     if completed.returncode != 0:
         raise EvidenceCollectionError(
             EvidenceErrorCode.NOT_A_WORKTREE,
@@ -132,8 +487,13 @@ def _resolve_worktree(path: Path) -> Path:
     return Path(root_text)
 
 
-def _read_object_format(root: Path) -> str:
-    output = _run_required(root, ("rev-parse", "--show-object-format"))
+def _read_object_format(root: Path, *, _budget: _CollectionBudget | None = None) -> str:
+    output = _run_required(
+        root,
+        ("rev-parse", "--show-object-format"),
+        _budget=_budget,
+        _stdout_limit=_CONTROL_OUTPUT_BYTES,
+    )
     try:
         object_format = _single_output_line(output, "object format").decode("ascii", "strict")
     except UnicodeDecodeError as error:
@@ -149,10 +509,12 @@ def _read_object_format(root: Path) -> str:
     return object_format
 
 
-def _read_object_directory(root: Path) -> Path:
+def _read_object_directory(root: Path, *, _budget: _CollectionBudget | None = None) -> Path:
     output = _run_required(
         root,
         ("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        _budget=_budget,
+        _stdout_limit=_CONTROL_OUTPUT_BYTES,
     )
     object_directory = Path(_decode_path(_single_path_output(output, "object directory")))
     if not object_directory.is_absolute():
@@ -165,11 +527,15 @@ def _resolve_ref(
     ref: str,
     invalid_code: EvidenceErrorCode,
     oid_length: int,
+    *,
+    _budget: _CollectionBudget | None = None,
 ) -> str:
     _validate_ref(ref, invalid_code)
-    completed = _invoke_git(
+    completed = _invoke_git_with_budget(
         root,
         ("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"),
+        budget=_budget,
+        stdout_limit=_CONTROL_OUTPUT_BYTES,
     )
     if completed.returncode != 0:
         raise EvidenceCollectionError(invalid_code, f"Git ref does not resolve to a commit: {ref}")
@@ -185,8 +551,20 @@ def _validate_ref(ref: str, invalid_code: EvidenceErrorCode) -> None:
         raise EvidenceCollectionError(invalid_code, "Git ref must be non-empty and contain no NUL")
 
 
-def _resolve_merge_base(root: Path, base_oid: str, head_oid: str, oid_length: int) -> str:
-    completed = _invoke_git(root, ("merge-base", "--all", base_oid, head_oid))
+def _resolve_merge_base(
+    root: Path,
+    base_oid: str,
+    head_oid: str,
+    oid_length: int,
+    *,
+    _budget: _CollectionBudget | None = None,
+) -> str:
+    completed = _invoke_git_with_budget(
+        root,
+        ("merge-base", "--all", base_oid, head_oid),
+        budget=_budget,
+        stdout_limit=_CONTROL_OUTPUT_BYTES,
+    )
     if completed.returncode == 1:
         raise EvidenceCollectionError(
             EvidenceErrorCode.NO_MERGE_BASE,
@@ -226,7 +604,10 @@ def _read_raw_changes(
     merge_base_oid: str,
     head_oid: str,
     oid_length: int,
+    *,
+    _budget: _CollectionBudget | None = None,
 ) -> tuple[_RawChange, ...]:
+    stdout_limit = _CONTROL_OUTPUT_BYTES if _budget is None else _RAW_CHANGE_OUTPUT_BYTES
     output = _run_object_git_required(
         object_format,
         object_directory,
@@ -247,11 +628,18 @@ def _read_raw_changes(
             head_oid,
         ),
         attribute_source=head_oid,
+        _budget=_budget,
+        _stdout_limit=stdout_limit,
     )
-    return _parse_raw_changes(output, oid_length)
+    return _parse_raw_changes(output, oid_length, _budget=_budget)
 
 
-def _parse_raw_changes(output: bytes, oid_length: int) -> tuple[_RawChange, ...]:
+def _parse_raw_changes(
+    output: bytes,
+    oid_length: int,
+    *,
+    _budget: _CollectionBudget | None = None,
+) -> tuple[_RawChange, ...]:
     if not output:
         return ()
     if not output.endswith(b"\0"):
@@ -260,6 +648,9 @@ def _parse_raw_changes(output: bytes, oid_length: int) -> tuple[_RawChange, ...]
     changes: list[_RawChange] = []
     index = 0
     while index < len(fields):
+        _check_deadline(_budget)
+        if _budget is not None and len(changes) >= _budget.limits.max_changed_files:
+            _raise_resource_limit("changed file limit exceeded")
         header = fields[index]
         index += 1
         if not header.startswith(b":"):
@@ -352,13 +743,17 @@ def _materialize_change(
     root: Path,
     raw: _RawChange,
     content_cache: dict[tuple[str, str], tuple[ContentKind, bytes | None]],
+    *,
+    _budget: _CollectionBudget | None = None,
 ) -> FileChangeEvidence:
+    _check_deadline(_budget)
     old = _materialize_version(
         root,
         raw.old_path,
         raw.old_mode,
         raw.old_oid,
         content_cache,
+        _budget=_budget,
     )
     new = _materialize_version(
         root,
@@ -366,17 +761,23 @@ def _materialize_change(
         raw.new_mode,
         raw.new_oid,
         content_cache,
+        _budget=_budget,
     )
     existing_versions = tuple(version for version in (old, new) if version is not None)
     hunks: tuple[DiffHunkEvidence, ...] = ()
     if existing_versions and all(
         version.content_kind is ContentKind.TEXT for version in existing_versions
     ):
+        old_content = _text_content(old, content_cache)
+        new_content = _text_content(new, content_cache)
         patch = _read_patch(
-            _text_content(old, content_cache),
-            _text_content(new, content_cache),
+            old_content,
+            new_content,
+            _budget=_budget,
         )
-        hunks = _parse_hunks(patch)
+        hunks = _parse_hunks(patch, _budget=_budget)
+        if _budget is not None and old_content != new_content and not hunks:
+            _raise_malformed("Git diff reported different text blobs without a hunk")
     return FileChangeEvidence(
         change_type=raw.change_type,
         rename_similarity=raw.rename_similarity,
@@ -392,26 +793,57 @@ def _materialize_version(
     mode: str,
     oid: str,
     content_cache: dict[tuple[str, str], tuple[ContentKind, bytes | None]],
+    *,
+    _budget: _CollectionBudget | None = None,
 ) -> FileVersion | None:
     if mode == "000000":
         return None
-    cache_key = (mode, oid)
+    cache_key = _content_cache_key(mode, oid)
     cached_content = content_cache.get(cache_key)
     if cached_content is None:
-        cached_content = _classify_content(root, mode, oid)
+        cached_content = _classify_content(root, mode, oid, _budget=_budget)
         content_cache[cache_key] = cached_content
     content_kind, _ = cached_content
     return FileVersion(path=path, mode=mode, oid=oid, content_kind=content_kind)
 
 
-def _classify_content(root: Path, mode: str, oid: str) -> tuple[ContentKind, bytes | None]:
-    if mode == "120000":
+def _classify_content(
+    root: Path,
+    mode: str,
+    oid: str,
+    *,
+    _budget: _CollectionBudget | None = None,
+) -> tuple[ContentKind, bytes | None]:
+    _check_deadline(_budget)
+    is_symlink = mode == "120000"
+    if is_symlink and _budget is None:
         return ContentKind.SYMLINK, None
     if mode == "160000":
         return ContentKind.SUBMODULE, None
-    if not mode.startswith("100"):
+    if not is_symlink and not mode.startswith("100"):
         return ContentKind.OTHER, None
-    content = _run_required(root, ("cat-file", "blob", oid))
+    if _budget is None:
+        content = _run_required(root, ("cat-file", "blob", oid))
+    else:
+        size_output = _run_required(
+            root,
+            ("cat-file", "-s", oid),
+            _budget=_budget,
+            _stdout_limit=_CONTROL_OUTPUT_BYTES,
+        )
+        size = _parse_blob_size(size_output)
+        _reserve_blob_bytes(_budget, size)
+        if is_symlink:
+            return ContentKind.SYMLINK, None
+        content = _run_required(
+            root,
+            ("cat-file", "blob", oid),
+            _budget=_budget,
+            _stdout_limit=size,
+            _stdout_overflow_code=EvidenceErrorCode.MALFORMED_GIT_OUTPUT,
+        )
+        if len(content) != size:
+            _raise_malformed("Git blob size changed during collection")
     if b"\0" in content:
         return ContentKind.BINARY, None
     try:
@@ -427,30 +859,69 @@ def _text_content(
 ) -> bytes:
     if version is None:
         return b""
-    content_kind, content = content_cache[(version.mode, version.oid)]
+    content_kind, content = content_cache[_content_cache_key(version.mode, version.oid)]
     if content_kind is not ContentKind.TEXT or content is None:
         _raise_malformed("text evidence is missing its cached blob content")
     return content
 
 
-def _read_patch(old_content: bytes, new_content: bytes) -> bytes:
+def _content_cache_key(mode: str, oid: str) -> tuple[str, str]:
+    return ("regular", oid) if mode.startswith("100") else (mode, oid)
+
+
+def _read_patch(
+    old_content: bytes,
+    new_content: bytes,
+    *,
+    _budget: _CollectionBudget | None = None,
+) -> bytes:
+    _check_deadline(_budget)
     if old_content == new_content:
         return b""
+    if _budget is not None and _budget.diff_bytes >= _budget.limits.max_diff_bytes:
+        _raise_resource_limit("diff byte limit exceeded")
     old_read, old_write, new_read, new_write = _open_patch_pipes()
-    writer_errors: list[OSError] = []
+    writer_errors: list[Exception] = []
     write_descriptors = (old_write, new_write)
-    writers = (
-        threading.Thread(
-            target=_write_pipe,
-            args=(old_write, old_content, writer_errors),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_write_pipe,
-            args=(new_write, new_content, writer_errors),
-            daemon=True,
-        ),
-    )
+    writer_stop_event = threading.Event()
+    if _budget is None:
+        writers = (
+            threading.Thread(
+                target=_write_pipe,
+                args=(old_write, old_content, writer_errors),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_write_pipe,
+                args=(new_write, new_content, writer_errors),
+                daemon=True,
+            ),
+        )
+    else:
+        writers = (
+            threading.Thread(
+                target=_write_pipe_bounded,
+                args=(
+                    old_write,
+                    old_content,
+                    writer_errors,
+                    writer_stop_event,
+                    _budget,
+                ),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_write_pipe_bounded,
+                args=(
+                    new_write,
+                    new_content,
+                    writer_errors,
+                    writer_stop_event,
+                    _budget,
+                ),
+                daemon=True,
+            ),
+        )
     started_writers = 0
     try:
         try:
@@ -462,15 +933,25 @@ def _read_patch(old_content: bytes, new_content: bytes) -> bytes:
                 EvidenceErrorCode.GIT_COMMAND_FAILED,
                 "patch writer threads could not be started",
             ) from error
-        completed = _invoke_no_index_diff(old_read, new_read)
+        if _budget is None:
+            completed = _invoke_no_index_diff(old_read, new_read)
+        else:
+            completed = _invoke_no_index_diff(
+                old_read,
+                new_read,
+                _budget=_budget,
+            )
     finally:
+        writer_stop_event.set()
         os.close(old_read)
         os.close(new_read)
+        started: list[threading.Thread] = []
         for index, writer in enumerate(writers):
             if index < started_writers:
-                writer.join()
+                started.append(writer)
             else:
                 os.close(write_descriptors[index])
+        _join_threads(started, "patch writer threads did not stop")
     if writer_errors:
         raise EvidenceCollectionError(
             EvidenceErrorCode.GIT_COMMAND_FAILED,
@@ -478,7 +959,11 @@ def _read_patch(old_content: bytes, new_content: bytes) -> bytes:
         ) from writer_errors[0]
     if completed.returncode != 1 or completed.stderr:
         _raise_command_failed(("diff", "--no-index"), completed)
-    if not _parse_hunks(completed.stdout):
+    if _budget is not None:
+        _reserve_diff_bytes(_budget, len(completed.stdout))
+    if _budget is None and not _parse_hunks(completed.stdout):
+        _raise_malformed("Git diff reported different text blobs without a hunk")
+    if _budget is not None and not completed.stdout:
         _raise_malformed("Git diff reported different text blobs without a hunk")
     return completed.stdout
 
@@ -503,7 +988,7 @@ def _open_patch_pipes() -> tuple[int, int, int, int]:
     return old_read, old_write, new_read, new_write
 
 
-def _write_pipe(file_descriptor: int, content: bytes, errors: list[OSError]) -> None:
+def _write_pipe(file_descriptor: int, content: bytes, errors: list[Exception]) -> None:
     try:
         with os.fdopen(file_descriptor, "wb") as stream:
             stream.write(content)
@@ -513,9 +998,51 @@ def _write_pipe(file_descriptor: int, content: bytes, errors: list[OSError]) -> 
         errors.append(error)
 
 
+def _write_pipe_bounded(
+    file_descriptor: int,
+    content: bytes,
+    errors: list[Exception],
+    stop_event: threading.Event,
+    budget: _CollectionBudget,
+) -> None:
+    offset = 0
+    view = memoryview(content)
+    try:
+        os.set_blocking(file_descriptor, False)
+        while offset < len(view):
+            if stop_event.is_set():
+                errors.append(OSError("bounded patch writer was cancelled"))
+                return
+            remaining = budget.deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append(TimeoutError("bounded patch writer exceeded its deadline"))
+                return
+            try:
+                written = os.write(
+                    file_descriptor,
+                    view[offset : offset + _READ_CHUNK_BYTES],
+                )
+            except BlockingIOError:
+                stop_event.wait(min(_POLL_SECONDS, remaining))
+                continue
+            if written == 0:
+                errors.append(OSError("bounded patch writer made no progress"))
+                return
+            offset += written
+    except BrokenPipeError:
+        pass
+    except (OSError, ValueError) as error:
+        errors.append(error)
+    finally:
+        with suppress(OSError):
+            os.close(file_descriptor)
+
+
 def _invoke_no_index_diff(
     old_file_descriptor: int,
     new_file_descriptor: int,
+    *,
+    _budget: _CollectionBudget | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     descriptor_root = _descriptor_root()
     environment = _git_environment()
@@ -528,8 +1055,9 @@ def _invoke_no_index_diff(
             "GIT_DIR": str(_GIT_FACADE_ROOT / "sha1"),
         }
     )
+    executable = "git" if _budget is None else _budget.git_executable
     command = [
-        "git",
+        executable,
         "--literal-pathspecs",
         "-c",
         f"core.attributesFile={os.devnull}",
@@ -558,6 +1086,17 @@ def _invoke_no_index_diff(
         f"{descriptor_root}/{old_file_descriptor}",
         f"{descriptor_root}/{new_file_descriptor}",
     ]
+    if _budget is not None:
+        stdout_limit = _budget.limits.max_diff_bytes - _budget.diff_bytes
+        return _invoke_bounded_process(
+            command,
+            environment=environment,
+            cwd=os.path.abspath(os.sep),
+            pass_fds=(old_file_descriptor, new_file_descriptor),
+            budget=_budget,
+            stdout_limit=stdout_limit,
+            stderr_limit=_CONTROL_OUTPUT_BYTES,
+        )
     try:
         return subprocess.run(
             command,
@@ -589,7 +1128,11 @@ def _descriptor_root() -> str:
     )
 
 
-def _parse_hunks(patch: bytes) -> tuple[DiffHunkEvidence, ...]:
+def _parse_hunks(
+    patch: bytes,
+    *,
+    _budget: _CollectionBudget | None = None,
+) -> tuple[DiffHunkEvidence, ...]:
     hunks: list[DiffHunkEvidence] = []
     current_header: tuple[int, int, int, int] | None = None
     current_lines: list[DiffLineEvidence] = []
@@ -598,6 +1141,7 @@ def _parse_hunks(patch: bytes) -> tuple[DiffHunkEvidence, ...]:
 
     def finish_current() -> None:
         nonlocal current_header, current_lines
+        _check_deadline(_budget)
         if current_header is None:
             return
         old_start, old_count, new_start, new_count = current_header
@@ -618,6 +1162,7 @@ def _parse_hunks(patch: bytes) -> tuple[DiffHunkEvidence, ...]:
         current_lines = []
 
     for raw_line in _split_lf(patch):
+        _check_deadline(_budget)
         header_match = _HUNK_PATTERN.match(raw_line)
         if header_match is not None:
             finish_current()
@@ -664,6 +1209,8 @@ def _parse_hunks(patch: bytes) -> tuple[DiffHunkEvidence, ...]:
         else:
             finish_current()
             continue
+        if _budget is not None:
+            _reserve_diff_line(_budget)
         payload = raw_line[1:]
         if payload.endswith(b"\n"):
             payload = payload[:-1]
@@ -687,12 +1234,16 @@ def _parse_hunks(patch: bytes) -> tuple[DiffHunkEvidence, ...]:
     return tuple(hunks)
 
 
-def _split_lf(data: bytes) -> tuple[bytes, ...]:
-    parts = data.split(b"\n")
-    lines = [part + b"\n" for part in parts[:-1]]
-    if parts[-1]:
-        lines.append(parts[-1])
-    return tuple(lines)
+def _split_lf(data: bytes) -> Iterator[bytes]:
+    position = 0
+    while position < len(data):
+        newline = data.find(b"\n", position)
+        if newline < 0:
+            yield data[position:]
+            return
+        end = newline + 1
+        yield data[position:end]
+        position = end
 
 
 def _change_sort_key(change: FileChangeEvidence) -> tuple[bytes, bytes]:
@@ -738,13 +1289,47 @@ def _decode_path(path: bytes) -> str:
         ) from error
 
 
+def _invoke_git_with_budget(
+    root: Path,
+    args: Sequence[str],
+    *,
+    budget: _CollectionBudget | None,
+    stdout_limit: int,
+    attribute_source: str | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    if budget is None:
+        if attribute_source is None:
+            return _invoke_git(root, args)
+        return _invoke_git(root, args, attribute_source=attribute_source)
+    return _invoke_git(
+        root,
+        args,
+        attribute_source=attribute_source,
+        _budget=budget,
+        _stdout_limit=stdout_limit,
+    )
+
+
 def _run_required(
     root: Path,
     args: Sequence[str],
     *,
     attribute_source: str | None = None,
+    _budget: _CollectionBudget | None = None,
+    _stdout_limit: int = _CONTROL_OUTPUT_BYTES,
+    _stdout_overflow_code: EvidenceErrorCode = EvidenceErrorCode.RESOURCE_LIMIT,
 ) -> bytes:
-    completed = _invoke_git(root, args, attribute_source=attribute_source)
+    if _budget is None:
+        completed = _invoke_git(root, args, attribute_source=attribute_source)
+    else:
+        completed = _invoke_git(
+            root,
+            args,
+            attribute_source=attribute_source,
+            _budget=_budget,
+            _stdout_limit=_stdout_limit,
+            _stdout_overflow_code=_stdout_overflow_code,
+        )
     if completed.returncode != 0:
         _raise_command_failed(args, completed)
     return completed.stdout
@@ -756,13 +1341,25 @@ def _run_object_git_required(
     args: Sequence[str],
     *,
     attribute_source: str,
+    _budget: _CollectionBudget | None = None,
+    _stdout_limit: int = _CONTROL_OUTPUT_BYTES,
 ) -> bytes:
-    completed = _invoke_object_git(
-        object_format,
-        object_directory,
-        args,
-        attribute_source=attribute_source,
-    )
+    if _budget is None:
+        completed = _invoke_object_git(
+            object_format,
+            object_directory,
+            args,
+            attribute_source=attribute_source,
+        )
+    else:
+        completed = _invoke_object_git(
+            object_format,
+            object_directory,
+            args,
+            attribute_source=attribute_source,
+            _budget=_budget,
+            _stdout_limit=_stdout_limit,
+        )
     if completed.returncode != 0:
         _raise_command_failed(args, completed)
     return completed.stdout
@@ -774,6 +1371,8 @@ def _invoke_object_git(
     args: Sequence[str],
     *,
     attribute_source: str,
+    _budget: _CollectionBudget | None = None,
+    _stdout_limit: int = _CONTROL_OUTPUT_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = _git_environment(attribute_source=attribute_source)
     environment.update(
@@ -784,8 +1383,9 @@ def _invoke_object_git(
             "GIT_OBJECT_DIRECTORY": str(object_directory),
         }
     )
+    executable = "git" if _budget is None else _budget.git_executable
     command = [
-        "git",
+        executable,
         "--literal-pathspecs",
         "-c",
         f"core.attributesFile={os.devnull}",
@@ -795,6 +1395,15 @@ def _invoke_object_git(
         "diff.suppressBlankEmpty=false",
         *args,
     ]
+    if _budget is not None:
+        return _invoke_bounded_process(
+            command,
+            environment=environment,
+            cwd=os.path.abspath(os.sep),
+            budget=_budget,
+            stdout_limit=_stdout_limit,
+            stderr_limit=_CONTROL_OUTPUT_BYTES,
+        )
     try:
         return subprocess.run(
             command,
@@ -820,10 +1429,14 @@ def _invoke_git(
     args: Sequence[str],
     *,
     attribute_source: str | None = None,
+    _budget: _CollectionBudget | None = None,
+    _stdout_limit: int = _CONTROL_OUTPUT_BYTES,
+    _stdout_overflow_code: EvidenceErrorCode = EvidenceErrorCode.RESOURCE_LIMIT,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = _git_environment(attribute_source=attribute_source)
+    executable = "git" if _budget is None else _budget.git_executable
     command = [
-        "git",
+        executable,
         "--literal-pathspecs",
         "-c",
         f"core.attributesFile={os.devnull}",
@@ -835,6 +1448,16 @@ def _invoke_git(
         str(root),
         *args,
     ]
+    if _budget is not None:
+        return _invoke_bounded_process(
+            command,
+            environment=environment,
+            cwd=None,
+            budget=_budget,
+            stdout_limit=_stdout_limit,
+            stderr_limit=_CONTROL_OUTPUT_BYTES,
+            stdout_overflow_code=_stdout_overflow_code,
+        )
     try:
         return subprocess.run(
             command,
@@ -855,7 +1478,11 @@ def _invoke_git(
 
 
 def _git_environment(*, attribute_source: str | None = None) -> dict[str, str]:
-    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("GIT_", "REPOGUARD_"))
+    }
     environment.update(
         {
             "GIT_ATTR_GLOBAL": os.devnull,
@@ -889,3 +1516,7 @@ def _raise_command_failed(
 
 def _raise_malformed(message: str) -> Never:
     raise EvidenceCollectionError(EvidenceErrorCode.MALFORMED_GIT_OUTPUT, message)
+
+
+def _raise_resource_limit(message: str) -> Never:
+    raise EvidenceCollectionError(EvidenceErrorCode.RESOURCE_LIMIT, message)

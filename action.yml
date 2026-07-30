@@ -1,0 +1,138 @@
+name: RepoGuard review
+description: Run one bounded RepoGuard review and upload its exact publication proposal.
+
+inputs:
+  repository-path:
+    description: Repository worktree to review.
+    required: false
+    default: "."
+  pr-number:
+    description: Exact pull request number.
+    required: true
+  base-sha:
+    description: Exact 40-hex pull request base commit.
+    required: true
+  head-sha:
+    description: Exact 40-hex pull request head commit.
+    required: true
+  mode:
+    description: Review mode.
+    required: false
+    default: deterministic
+  provider:
+    description: Model provider, or none for deterministic review.
+    required: false
+    default: none
+  model:
+    description: Exact model name for model-backed review.
+    required: false
+    default: ""
+  cache-dir:
+    description: Absolute offline retrieval cache directory.
+    required: false
+    default: ""
+  device:
+    description: Embedding device.
+    required: false
+    default: cpu
+  fail-on:
+    description: Lowest finding severity that fails policy.
+    required: false
+    default: high
+
+outputs:
+  result-path:
+    description: Path to the canonical path-free product result.
+    value: ${{ steps.prepare.outputs.result-path }}
+  result-sha256:
+    description: Domain-separated combined review identity.
+    value: ${{ steps.prepare.outputs.result-sha256 }}
+  evidence-path:
+    description: Path to the canonical path-free evidence identity.
+    value: ${{ steps.prepare.outputs.evidence-path }}
+  evidence-sha256:
+    description: Domain-separated evidence identity.
+    value: ${{ steps.prepare.outputs.evidence-sha256 }}
+  review-path:
+    description: Path to the canonical deterministic-review projection.
+    value: ${{ steps.prepare.outputs.review-path }}
+  review-sha256:
+    description: Domain-separated deterministic review identity.
+    value: ${{ steps.prepare.outputs.review-sha256 }}
+  proposal-path:
+    description: Path to the single canonical proposal.json.
+    value: ${{ steps.prepare.outputs.proposal-path }}
+  proposal-sha256:
+    description: Domain-separated GitHub proposal identity.
+    value: ${{ steps.prepare.outputs.proposal-sha256 }}
+  artifact-id:
+    description: GitHub artifact ID returned by upload-artifact.
+    value: ${{ steps.upload.outputs.artifact-id }}
+  artifact-digest:
+    description: GitHub artifact digest returned by upload-artifact.
+    value: ${{ steps.upload.outputs.artifact-digest }}
+  finding-count:
+    description: Exact number of findings.
+    value: ${{ steps.prepare.outputs.finding-count }}
+  highest-severity:
+    description: Highest finding severity, or an empty string.
+    value: ${{ steps.prepare.outputs.highest-severity }}
+  conclusion:
+    description: Stable review conclusion.
+    value: ${{ steps.prepare.outputs.conclusion }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate context and prepare review proposal
+      id: prepare
+      shell: bash
+      env:
+        REPOGUARD_ACTION_COMMAND: review
+        REPOGUARD_ACTION_REF: ${{ github.action_ref }}
+        REPOGUARD_ACTION_REPOSITORY: ${{ github.action_repository }}
+        REPOGUARD_ACTOR: ${{ github.actor }}
+        REPOGUARD_BASE_SHA: ${{ inputs.base-sha }}
+        REPOGUARD_CACHE_DIR: ${{ inputs.cache-dir }}
+        REPOGUARD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REPOGUARD_DEVICE: ${{ inputs.device }}
+        REPOGUARD_EVENT_NAME: ${{ github.event_name }}
+        REPOGUARD_EVENT_PATH: ${{ github.event_path }}
+        REPOGUARD_FAIL_ON: ${{ inputs.fail-on }}
+        REPOGUARD_HEAD_SHA: ${{ inputs.head-sha }}
+        REPOGUARD_HOST_PROFILE: ${{ env.REPOGUARD_HOST_PROFILE }}
+        REPOGUARD_MODE: ${{ inputs.mode }}
+        REPOGUARD_MODEL: ${{ inputs.model }}
+        REPOGUARD_PR_NUMBER: ${{ inputs.pr-number }}
+        REPOGUARD_PROVIDER: ${{ inputs.provider }}
+        REPOGUARD_REF: ${{ github.ref }}
+        REPOGUARD_REPOSITORY_ALIAS: ${{ env.REPOGUARD_REPOSITORY_ALIAS }}
+        REPOGUARD_REPOSITORY_FULL_NAME: ${{ github.repository }}
+        REPOGUARD_REPOSITORY_ID: ${{ github.repository_id }}
+        REPOGUARD_REPOSITORY_PATH: ${{ inputs.repository-path }}
+        REPOGUARD_RUN_ATTEMPT: ${{ github.run_attempt }}
+        REPOGUARD_RUN_ID: ${{ github.run_id }}
+        REPOGUARD_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        REPOGUARD_WORKSPACE: ${{ github.workspace }}
+      run: |
+        exec python3 -I "${GITHUB_ACTION_PATH}/scripts/m6_action.py" review
+
+    - name: Upload exact review proposal
+      id: upload
+      if: ${{ steps.prepare.outputs.github-write-supported == 'true' }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: repoguard-proposal-v1-${{ steps.prepare.outputs.proposal-sha256 }}
+        path: ${{ steps.prepare.outputs.proposal-path }}
+        if-no-files-found: error
+        retention-days: "1"
+        compression-level: "0"
+        overwrite: "false"
+        include-hidden-files: "false"
+
+    - name: Enforce review policy conclusion
+      shell: bash
+      env:
+        REPOGUARD_REVIEW_CONCLUSION: ${{ steps.prepare.outputs.conclusion }}
+      run: |
+        exec python3 -I "${GITHUB_ACTION_PATH}/scripts/m6_action.py" review-conclusion
