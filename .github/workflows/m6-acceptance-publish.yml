@@ -72,7 +72,7 @@ jobs:
     steps:
       - name: Publish exact approved proposal
         id: publish
-        uses: k3nuuong/RepoGuard/actions/publish@f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3
+        uses: k3nuuong/RepoGuard/actions/publish@f71d620de1a66566a414c483c0879f9dd1a37fa4
         env:
           REPOGUARD_ANTHROPIC_API_KEY: ""
           REPOGUARD_GITHUB_TOKEN: ${{ secrets.REPOGUARD_GITHUB_TOKEN }}

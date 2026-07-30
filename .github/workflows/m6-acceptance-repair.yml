@@ -76,7 +76,7 @@ jobs:
 
       - name: Prepare exact deterministic repair
         id: repair
-        uses: k3nuuong/RepoGuard/actions/repair@f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3
+        uses: k3nuuong/RepoGuard/actions/repair@f71d620de1a66566a414c483c0879f9dd1a37fa4
         env:
           REPOGUARD_ANTHROPIC_API_KEY: ""
           REPOGUARD_GITHUB_TOKEN: ${{ github.token }}
