@@ -1,0 +1,134 @@
+name: RepoGuard publish
+description: Publish one exact approved RepoGuard proposal after protected-environment review.
+
+inputs:
+  kind:
+    description: Publication kind, check or repair.
+    required: true
+  proposal-sha256:
+    description: Exact domain-separated proposal identity.
+    required: true
+  source-run-id:
+    description: Exact workflow run that created the proposal artifact.
+    required: true
+  source-run-attempt:
+    description: Exact attempt that created the proposal artifact.
+    required: true
+  artifact-id:
+    description: Exact proposal artifact ID.
+    required: true
+  artifact-digest:
+    description: Exact proposal artifact SHA-256 digest.
+    required: true
+  confirmation:
+    description: Exact fixed human publication confirmation.
+    required: true
+
+outputs:
+  approval-sha256:
+    description: Exact authenticated GitHub approval identity.
+    value: ${{ steps.publish.outputs.approval-sha256 }}
+  result-sha256:
+    description: Exact GitHub publication result identity.
+    value: ${{ steps.publish.outputs.result-sha256 }}
+  state:
+    description: Stable publication state.
+    value: ${{ steps.publish.outputs.state }}
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate persistent runner Python capability
+      id: runner
+      shell: bash
+      env:
+        REPOGUARD_ACTION_REF: ${{ github.action_ref }}
+        REPOGUARD_ACTION_REPOSITORY: ${{ github.action_repository }}
+        REPOGUARD_ACTION_SOURCE_ROOT: ${{ env.REPOGUARD_ACTION_SOURCE_ROOT }}
+        REPOGUARD_HOST_PROFILE: ${{ env.REPOGUARD_HOST_PROFILE }}
+        REPOGUARD_PYTHON: ${{ env.REPOGUARD_PYTHON }}
+        REPOGUARD_RUN_ATTEMPT: ${{ github.run_attempt }}
+        REPOGUARD_RUNNER_LABELS: ${{ env.REPOGUARD_RUNNER_LABELS }}
+        REPOGUARD_WORKSPACE: ${{ github.workspace }}
+      run: |
+        exec /usr/bin/python3 -I "${GITHUB_ACTION_PATH}/../../scripts/m6_action.py" runner-preflight
+
+    - name: Validate protected publication context
+      id: preflight
+      shell: bash
+      env:
+        REPOGUARD_ACTION_COMMAND: publish-preflight
+        REPOGUARD_ACTION_DRIVER: ${{ steps.runner.outputs.driver-path }}
+        REPOGUARD_ACTION_REF: ${{ github.action_ref }}
+        REPOGUARD_ACTION_REPOSITORY: ${{ github.action_repository }}
+        REPOGUARD_ACTION_SOURCE_ROOT: ${{ env.REPOGUARD_ACTION_SOURCE_ROOT }}
+        REPOGUARD_ACTOR: ${{ github.actor }}
+        REPOGUARD_ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+        REPOGUARD_ARTIFACT_ID: ${{ inputs.artifact-id }}
+        REPOGUARD_CONFIRMATION: ${{ inputs.confirmation }}
+        REPOGUARD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REPOGUARD_EVENT_NAME: ${{ github.event_name }}
+        REPOGUARD_EVENT_PATH: ${{ github.event_path }}
+        REPOGUARD_HOST_PROFILE: ${{ env.REPOGUARD_HOST_PROFILE }}
+        REPOGUARD_KIND: ${{ inputs.kind }}
+        REPOGUARD_PROPOSAL_SHA256: ${{ inputs.proposal-sha256 }}
+        REPOGUARD_REF: ${{ github.ref }}
+        REPOGUARD_REPOSITORY_ALIAS: ${{ env.REPOGUARD_REPOSITORY_ALIAS }}
+        REPOGUARD_REPOSITORY_FULL_NAME: ${{ github.repository }}
+        REPOGUARD_REPOSITORY_ID: ${{ github.repository_id }}
+        REPOGUARD_RUN_ATTEMPT: ${{ github.run_attempt }}
+        REPOGUARD_RUN_ID: ${{ github.run_id }}
+        REPOGUARD_RUNNER_LABELS: ${{ env.REPOGUARD_RUNNER_LABELS }}
+        REPOGUARD_SOURCE_RUN_ATTEMPT: ${{ inputs.source-run-attempt }}
+        REPOGUARD_SOURCE_RUN_ID: ${{ inputs.source-run-id }}
+        REPOGUARD_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        REPOGUARD_WORKSPACE: ${{ github.workspace }}
+        REPOGUARD_PYTHON: ${{ steps.runner.outputs.python-path }}
+      run: |
+        exec "$REPOGUARD_PYTHON" -I "$REPOGUARD_ACTION_DRIVER" publish-preflight
+
+    - name: Download exact proposal artifact
+      id: download
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.artifact-id }}
+        path: ${{ steps.preflight.outputs.download-path }}
+        merge-multiple: "true"
+        github-token: ${{ env.REPOGUARD_GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.source-run-id }}
+
+    - name: Verify, approve, and publish exact proposal
+      id: publish
+      shell: bash
+      env:
+        REPOGUARD_ACTION_COMMAND: publish
+        REPOGUARD_ACTION_DRIVER: ${{ steps.runner.outputs.driver-path }}
+        REPOGUARD_ACTION_REF: ${{ github.action_ref }}
+        REPOGUARD_ACTION_REPOSITORY: ${{ github.action_repository }}
+        REPOGUARD_ACTION_SOURCE_ROOT: ${{ env.REPOGUARD_ACTION_SOURCE_ROOT }}
+        REPOGUARD_ACTOR: ${{ github.actor }}
+        REPOGUARD_ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+        REPOGUARD_ARTIFACT_ID: ${{ inputs.artifact-id }}
+        REPOGUARD_CONFIRMATION: ${{ inputs.confirmation }}
+        REPOGUARD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REPOGUARD_DOWNLOAD_PATH: ${{ steps.download.outputs.download-path }}
+        REPOGUARD_EVENT_NAME: ${{ github.event_name }}
+        REPOGUARD_EVENT_PATH: ${{ github.event_path }}
+        REPOGUARD_HOST_PROFILE: ${{ env.REPOGUARD_HOST_PROFILE }}
+        REPOGUARD_KIND: ${{ inputs.kind }}
+        REPOGUARD_PROPOSAL_SHA256: ${{ inputs.proposal-sha256 }}
+        REPOGUARD_REF: ${{ github.ref }}
+        REPOGUARD_REPOSITORY_ALIAS: ${{ env.REPOGUARD_REPOSITORY_ALIAS }}
+        REPOGUARD_REPOSITORY_FULL_NAME: ${{ github.repository }}
+        REPOGUARD_REPOSITORY_ID: ${{ github.repository_id }}
+        REPOGUARD_RUN_ATTEMPT: ${{ github.run_attempt }}
+        REPOGUARD_RUN_ID: ${{ github.run_id }}
+        REPOGUARD_RUNNER_LABELS: ${{ env.REPOGUARD_RUNNER_LABELS }}
+        REPOGUARD_SOURCE_RUN_ATTEMPT: ${{ inputs.source-run-attempt }}
+        REPOGUARD_SOURCE_RUN_ID: ${{ inputs.source-run-id }}
+        REPOGUARD_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        REPOGUARD_WORKSPACE: ${{ github.workspace }}
+        REPOGUARD_PYTHON: ${{ steps.runner.outputs.python-path }}
+      run: |
+        exec "$REPOGUARD_PYTHON" -I "$REPOGUARD_ACTION_DRIVER" publish

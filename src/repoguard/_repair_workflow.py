@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import time
 from contextlib import suppress
@@ -14,13 +15,16 @@ from typing import NoReturn
 from repoguard._repair_git import (
     _capture_repository,
     _export_candidate_projection,
+    _inspect_repair_publication,
     _materialize_candidate,
     _MaterializedCandidate,
     _open_materialized_candidate,
+    _PublicationManifestObjects,
     _publish_repair_ref,
     _read_candidate_tree_files,
     _read_head_file,
     _read_materialized_files,
+    _read_repair_publication_blob,
     _read_repair_ref,
     _RepositoryIdentity,
     _resolve_repository_layout,
@@ -84,6 +88,7 @@ from repoguard._repair_store import (
     _list_session_ids,
     _locked_session,
     _manager_lock,
+    _open_existing_runtime_root,
     _remove_session_store,
     _RuntimeRootIdentity,
     _session_path_guard,
@@ -109,6 +114,9 @@ from repoguard.repair import (
     RepairManager,
     RepairManagerConfig,
     RepairPreview,
+    RepairPublicationBlob,
+    RepairPublicationEntry,
+    RepairPublicationManifest,
     RepairSession,
     RepairSnapshot,
     RepairStage,
@@ -119,6 +127,7 @@ from repoguard.repair import (
     repair_context_summary_to_dict,
     repair_preview_to_dict,
     repair_prompt_identity_to_dict,
+    repair_publication_manifest_to_dict,
     validation_command_result_to_dict,
 )
 from repoguard.retrieval import ContextIndex, IndexIdentity, RetrievalError
@@ -156,6 +165,9 @@ class _SessionMaintenanceResult:
     removed: bool = False
     cleanup_pending: bool = False
     failed: bool = False
+
+
+_PUBLICATION_MANIFEST_DOMAIN = b"repoguard.m6.repair_publication_manifest.v1\x00"
 
 
 def _initialize_manager(
@@ -263,6 +275,54 @@ def _open_session(manager: RepairManager, session_id: str) -> None:
         runtime_root_identity=manager._runtime_root_identity,
     ) as storage:
         storage.load()
+
+
+def _read_session_snapshot(
+    repository: RepositoryInput,
+    config: RepairManagerConfig,
+    session_id: str,
+) -> RepairSnapshot:
+    runtime_root_identity = _read_only_runtime_identity(repository, config, session_id)
+    with _locked_session(
+        config,
+        session_id,
+        runtime_root_identity=runtime_root_identity,
+        read_only=True,
+    ) as storage:
+        return storage.load().snapshot
+
+
+def _read_session_preview(
+    repository: RepositoryInput,
+    config: RepairManagerConfig,
+    session_id: str,
+) -> RepairPreview:
+    runtime_root_identity = _read_only_runtime_identity(repository, config, session_id)
+    with _locked_session(
+        config,
+        session_id,
+        runtime_root_identity=runtime_root_identity,
+        read_only=True,
+    ) as storage:
+        return _preview_from_storage(storage, session_id)
+
+
+def _read_only_runtime_identity(
+    repository: RepositoryInput,
+    config: RepairManagerConfig,
+    session_id: str,
+) -> _RuntimeRootIdentity:
+    if type(repository) is not RepositoryInput or type(config) is not RepairManagerConfig:
+        _raise_error(RepairErrorCode.INVALID_CONFIG, RepairStage.INPUT, None, None)
+    if not _is_session_id(session_id):
+        _raise_error(RepairErrorCode.SESSION_NOT_FOUND, RepairStage.SESSION, None, None)
+    layout = _resolve_repository_layout(repository, config.git_executable)
+    return _open_existing_runtime_root(
+        config,
+        repository_root=layout.root,
+        common_dir=layout.common_dir,
+        session_id=session_id,
+    )
 
 
 def _recover(manager: RepairManager) -> RepairMaintenanceReport:
@@ -918,42 +978,49 @@ def _converge_rejected_sandbox_run(session: RepairSession) -> RepairSnapshot:
 
 
 def _preview(session: RepairSession) -> RepairPreview:
-    invalid_preview = False
-    preview: RepairPreview | None = None
     with _locked_session(
         session._manager._config,
         session._session_id,
         runtime_root_identity=session._manager._runtime_root_identity,
     ) as storage:
-        snapshot = storage.load().snapshot
-        candidate = snapshot.candidate
-        if candidate is None:
-            _raise_for_state(snapshot, RepairErrorCode.INVALID_STATE, RepairStage.SESSION)
-        try:
-            preview = _repair_preview_from_dict(storage.read_preview())
-        except (TypeError, ValueError):
-            invalid_preview = True
-        if preview is not None and (
-            preview.session_id != snapshot.session_id
-            or preview.candidate_id != candidate.candidate_id
-            or preview.changed_paths != candidate.changed_paths
-        ):
-            invalid_preview = True
-        if not invalid_preview and preview is not None:
-            validation_sha256 = (
-                None if snapshot.validation is None else snapshot.validation.validation_sha256
-            )
-            preview = replace(
-                preview,
-                state=snapshot.state,
-                validation_sha256=validation_sha256,
-            )
+        return _preview_from_storage(storage, session._session_id)
+
+
+def _preview_from_storage(
+    storage: _SessionStore,
+    session_id: str,
+) -> RepairPreview:
+    invalid_preview = False
+    preview: RepairPreview | None = None
+    snapshot = storage.load().snapshot
+    candidate = snapshot.candidate
+    if candidate is None:
+        _raise_for_state(snapshot, RepairErrorCode.INVALID_STATE, RepairStage.SESSION)
+    try:
+        preview = _repair_preview_from_dict(storage.read_preview())
+    except (TypeError, ValueError):
+        invalid_preview = True
+    if preview is not None and (
+        preview.session_id != snapshot.session_id
+        or preview.candidate_id != candidate.candidate_id
+        or preview.changed_paths != candidate.changed_paths
+    ):
+        invalid_preview = True
+    if not invalid_preview and preview is not None:
+        validation_sha256 = (
+            None if snapshot.validation is None else snapshot.validation.validation_sha256
+        )
+        preview = replace(
+            preview,
+            state=snapshot.state,
+            validation_sha256=validation_sha256,
+        )
     if invalid_preview or preview is None:
         _raise_error(
             RepairErrorCode.SESSION_CORRUPT,
             RepairStage.PERSISTENCE,
             snapshot.state,
-            session._session_id,
+            session_id,
         )
     return preview
 
@@ -1383,6 +1450,185 @@ def _snapshot(session: RepairSession) -> RepairSnapshot:
         runtime_root_identity=session._manager._runtime_root_identity,
     ) as storage:
         return storage.load().snapshot
+
+
+def _publication_manifest(
+    session: RepairSession,
+    *,
+    expected_application_sha256: str,
+) -> RepairPublicationManifest:
+    with _locked_session(
+        session._manager._config,
+        session._session_id,
+        runtime_root_identity=session._manager._runtime_root_identity,
+    ) as storage:
+        snapshot = storage.load().snapshot
+        _require_publication_application(snapshot, expected_application_sha256)
+        publication = _inspect_publication_objects(session, snapshot)
+        return _build_publication_manifest(snapshot, publication)
+
+
+def _publication_blob(
+    session: RepairSession,
+    *,
+    manifest: RepairPublicationManifest,
+    entry: RepairPublicationEntry,
+) -> RepairPublicationBlob:
+    if type(manifest) is not RepairPublicationManifest or type(entry) is not RepairPublicationEntry:
+        _raise_error(
+            RepairErrorCode.IDENTITY_MISMATCH,
+            RepairStage.APPLICATION,
+            None,
+            session._session_id,
+        )
+    with _locked_session(
+        session._manager._config,
+        session._session_id,
+        runtime_root_identity=session._manager._runtime_root_identity,
+    ) as storage:
+        snapshot = storage.load().snapshot
+        _require_publication_application(snapshot, manifest.application_sha256)
+        publication = _inspect_publication_objects(session, snapshot)
+        current_manifest = _build_publication_manifest(snapshot, publication)
+        if manifest != current_manifest or entry not in current_manifest.entries:
+            _raise_for_state(
+                snapshot,
+                RepairErrorCode.IDENTITY_MISMATCH,
+                RepairStage.APPLICATION,
+            )
+        content = b""
+        try:
+            content = _read_repair_publication_blob(
+                publication,
+                session._manager._config.git_executable,
+                path=entry.path,
+                mode=entry.mode,
+                blob_oid=entry.blob_oid,
+                size=entry.size,
+            )
+            result = RepairPublicationBlob(1, manifest.manifest_sha256, entry, content)
+        except RepairError as error:
+            _raise_error(
+                error.code,
+                RepairStage.APPLICATION,
+                snapshot.state,
+                snapshot.session_id,
+            )
+        except (OSError, TypeError, ValueError, UnicodeError):
+            _raise_for_state(
+                snapshot,
+                RepairErrorCode.PUBLICATION_FAILED,
+                RepairStage.APPLICATION,
+            )
+        return result
+
+
+def _require_publication_application(
+    snapshot: RepairSnapshot,
+    expected_application_sha256: str,
+) -> None:
+    if snapshot.state is not RepairState.APPLIED:
+        _raise_for_state(snapshot, RepairErrorCode.INVALID_STATE, RepairStage.APPLICATION)
+    application = snapshot.application
+    candidate = snapshot.candidate
+    approval = snapshot.approval
+    if application is None or candidate is None or approval is None:
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.SESSION_CORRUPT,
+            RepairStage.APPLICATION,
+        )
+    if type(expected_application_sha256) is not str or not hmac.compare_digest(
+        expected_application_sha256, application.application_sha256
+    ):
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.IDENTITY_MISMATCH,
+            RepairStage.APPLICATION,
+        )
+
+
+def _inspect_publication_objects(
+    session: RepairSession,
+    snapshot: RepairSnapshot,
+) -> _PublicationManifestObjects:
+    candidate = snapshot.candidate
+    if candidate is None:
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.SESSION_CORRUPT,
+            RepairStage.APPLICATION,
+        )
+    try:
+        return _inspect_repair_publication(
+            session._manager._repository,
+            session._manager._config.git_executable,
+            candidate_id=candidate.candidate_id,
+            expected_tree_oid=candidate.tree_oid,
+            expected_commit_oid=candidate.commit_oid,
+            expected_changed_paths=candidate.changed_paths,
+        )
+    except RepairError as error:
+        _raise_error(
+            error.code,
+            RepairStage.APPLICATION,
+            snapshot.state,
+            snapshot.session_id,
+        )
+    except (OSError, TypeError, ValueError, UnicodeError):
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.PUBLICATION_FAILED,
+            RepairStage.APPLICATION,
+        )
+
+
+def _build_publication_manifest(
+    snapshot: RepairSnapshot,
+    publication: _PublicationManifestObjects,
+) -> RepairPublicationManifest:
+    application = snapshot.application
+    approval = snapshot.approval
+    candidate = snapshot.candidate
+    if application is None or approval is None or candidate is None:
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.SESSION_CORRUPT,
+            RepairStage.APPLICATION,
+        )
+    try:
+        entries = tuple(
+            RepairPublicationEntry(1, item.path, item.mode, item.oid, item.size)
+            for item in publication.entries
+            if item.size is not None
+        )
+        manifest = RepairPublicationManifest(
+            1,
+            "0" * 64,
+            snapshot.session_id,
+            application.application_sha256,
+            approval.approval_sha256,
+            candidate.candidate_id,
+            publication.source.object_format,
+            publication.ref,
+            publication.parent_oid,
+            publication.tree_oid,
+            publication.commit_oid,
+            entries,
+            publication.total_blob_bytes,
+        )
+        payload = repair_publication_manifest_to_dict(manifest)
+        del payload["manifest_sha256"]
+        manifest_sha256 = hashlib.sha256(
+            _PUBLICATION_MANIFEST_DOMAIN + _canonical_bytes(payload)
+        ).hexdigest()
+        return replace(manifest, manifest_sha256=manifest_sha256)
+    except (TypeError, ValueError, UnicodeError):
+        _raise_for_state(
+            snapshot,
+            RepairErrorCode.PUBLICATION_FAILED,
+            RepairStage.APPLICATION,
+        )
 
 
 def _capture_context_identity(context_index: ContextIndex | None) -> IndexIdentity | None:

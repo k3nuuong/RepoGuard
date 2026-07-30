@@ -12,6 +12,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -48,6 +49,8 @@ from repoguard.repair import (
     RepairState,
     RepairValidation,
     ValidationCommandResult,
+    read_repair_preview,
+    read_repair_snapshot,
     repair_application_to_dict,
     repair_candidate_to_dict,
     repair_decision_to_dict,
@@ -323,6 +326,81 @@ def _validated_session(
         storage.append("validation_result", validation_result)
         storage.append("validated", validated, clear_validation_run=True)
     return config, session
+
+
+def _durable_tree(root: Path) -> tuple[tuple[object, ...], ...]:
+    records: list[tuple[object, ...]] = []
+    for path in sorted((root, *root.rglob("*"))):
+        metadata = path.lstat()
+        content = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+        records.append(
+            (
+                str(path.relative_to(root)),
+                stat.S_IFMT(metadata.st_mode),
+                stat.S_IMODE(metadata.st_mode),
+                metadata.st_uid,
+                metadata.st_gid,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+                content,
+            )
+        )
+    return tuple(records)
+
+
+def test_public_readers_never_initialize_or_repair_session_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _ = _validated_session(tmp_path, monkeypatch)
+    repository = RepositoryInput(tmp_path / "repository")
+    monkeypatch.setattr(
+        workflow_module,
+        "_resolve_repository_layout",
+        lambda *_: SimpleNamespace(
+            root=repository.path,
+            common_dir=repository.path / ".git",
+        ),
+    )
+    cache = config.runtime_root / "sessions" / _SESSION / "state.json"
+    cache.write_bytes(b"not canonical state")
+    cache.chmod(0o600)
+    before = _durable_tree(config.runtime_root)
+
+    snapshot = read_repair_snapshot(repository, config, _SESSION)
+    preview = read_repair_preview(repository, config, _SESSION)
+
+    assert snapshot.state is RepairState.VALIDATED
+    assert preview.state is RepairState.VALIDATED
+    assert preview.candidate_id == _CANDIDATE
+    assert cache.read_bytes() == b"not canonical state"
+    assert _durable_tree(config.runtime_root) == before
+
+
+def test_public_reader_missing_runtime_is_read_only_session_not_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "repository"
+    common_dir = repository_root / ".git"
+    common_dir.mkdir(mode=0o700, parents=True)
+    repository = RepositoryInput(repository_root)
+    config = _config(tmp_path / "absent-runtime")
+    monkeypatch.setattr(store_module, "_validate_host_inputs", lambda _config: None)
+    monkeypatch.setattr(
+        workflow_module,
+        "_resolve_repository_layout",
+        lambda *_: SimpleNamespace(root=repository_root, common_dir=common_dir),
+    )
+
+    with pytest.raises(RepairError) as raised:
+        read_repair_snapshot(repository, config, _SESSION)
+
+    assert raised.value.code is RepairErrorCode.SESSION_NOT_FOUND
+    assert raised.value.stage is RepairStage.SESSION
+    assert not config.runtime_root.exists()
 
 
 def test_runtime_and_session_creation_are_atomic_and_permissioned(

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import shlex
+import shutil
 import subprocess
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -246,6 +248,55 @@ def test_build_reads_exact_head_and_fuses_all_channels(
     assert index.statistics.excluded_file_count == 3
     index.close()
     assert provider.close_count == 1
+
+
+def test_build_uses_fixed_git_and_strips_product_secrets(
+    repository_bundle: tuple[Path, EvidenceBundle],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, bundle = repository_bundle
+    real_git = shutil.which("git")
+    assert real_git is not None
+    fixed_log = tmp_path / "fixed-log"
+    leaked_marker = tmp_path / "secret-leaked"
+    fixed_git = tmp_path / "fixed-git"
+    fixed_git.write_text(
+        "#!/bin/sh\n"
+        'if [ -n "${REPOGUARD_GITHUB_TOKEN+x}" ]; then\n'
+        f"  printf leaked > {shlex.quote(str(leaked_marker))}\n"
+        "fi\n"
+        f"printf x >> {shlex.quote(str(fixed_log))}\n"
+        f'exec {shlex.quote(real_git)} "$@"\n',
+        encoding="ascii",
+    )
+    fixed_git.chmod(0o700)
+    hostile_directory = tmp_path / "hostile"
+    hostile_directory.mkdir()
+    hostile_marker = tmp_path / "path-used"
+    hostile_git = hostile_directory / "git"
+    hostile_git.write_text(
+        f"#!/bin/sh\nprintf used > {shlex.quote(str(hostile_marker))}\nexit 99\n",
+        encoding="ascii",
+    )
+    hostile_git.chmod(0o700)
+    monkeypatch.setenv("PATH", str(hostile_directory))
+    monkeypatch.setenv("REPOGUARD_GITHUB_TOKEN", "sentinel")
+    monkeypatch.setenv("REPOGUARD_OPENAI_API_KEY", "sentinel")
+    monkeypatch.setenv("REPOGUARD_ANTHROPIC_API_KEY", "sentinel")
+
+    with build_context_index(
+        bundle,
+        embedding_provider=_FakeEmbedding(),
+        git_executable=fixed_git,
+    ):
+        pass
+
+    assert fixed_log.read_text(encoding="ascii")
+    assert not hostile_marker.exists()
+    assert not leaked_marker.exists()
+    environment = retrieval_impl._git_environment()
+    assert not any(name.startswith("REPOGUARD_") for name in environment)
 
 
 def test_private_key_range_is_redacted_before_any_result_boundary(
