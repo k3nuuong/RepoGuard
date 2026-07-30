@@ -92,7 +92,7 @@ jobs:
           lfs: false
           path: trusted-source
           persist-credentials: false
-          ref: f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3
+          ref: f71d620de1a66566a414c483c0879f9dd1a37fa4
           repository: k3nuuong/RepoGuard
           set-safe-directory: false
           show-progress: false
@@ -177,7 +177,7 @@ jobs:
               "github_actions": {
                   "action_repository": "k3nuuong/RepoGuard",
                   "action_sha": (
-                      "f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3"
+                      "f71d620de1a66566a414c483c0879f9dd1a37fa4"
                   ),
                   "publisher": None,
               },
@@ -219,7 +219,7 @@ jobs:
 
       - name: Run exact deterministic review
         id: review
-        uses: k3nuuong/RepoGuard@f97e2f13a61ce1d9a9a17a8c6a376006ceed31a3
+        uses: k3nuuong/RepoGuard@f71d620de1a66566a414c483c0879f9dd1a37fa4
         env:
           REPOGUARD_ANTHROPIC_API_KEY: ""
           REPOGUARD_GITHUB_TOKEN: ${{ github.token }}
