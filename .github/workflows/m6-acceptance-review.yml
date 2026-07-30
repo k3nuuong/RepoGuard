@@ -330,6 +330,103 @@ jobs:
               )
           )
           PY
+          python3 -I - <<'PY'
+          import http.client
+          import json
+          import os
+          import socket
+          import ssl
+
+          probe = {
+              "environment": {
+                  name: bool(os.environ.get(name))
+                  for name in (
+                      "HTTPS_PROXY",
+                      "NO_PROXY",
+                      "SSL_CERT_DIR",
+                      "SSL_CERT_FILE",
+                  )
+              }
+          }
+          try:
+              addresses = socket.getaddrinfo(
+                  "api.github.com",
+                  443,
+                  type=socket.SOCK_STREAM,
+              )
+              probe["dns"] = {
+                  "address_count": len(addresses),
+                  "families": sorted({item[0] for item in addresses}),
+              }
+          except Exception as error:
+              probe["dns"] = {"error_type": type(error).__name__}
+
+          connection = None
+          stage = "tls_context"
+          try:
+              context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+              context.minimum_version = ssl.TLSVersion.TLSv1_2
+              context.verify_mode = ssl.CERT_REQUIRED
+              context.check_hostname = True
+              context.load_default_certs(ssl.Purpose.SERVER_AUTH)
+              stage = "connect"
+              connection = http.client.HTTPSConnection(
+                  "api.github.com",
+                  443,
+                  timeout=5.0,
+                  context=context,
+              )
+              connection.connect()
+              stage = "request"
+              connection.putrequest(
+                  "GET",
+                  "/rate_limit",
+                  skip_host=True,
+                  skip_accept_encoding=True,
+              )
+              connection.putheader("Accept", "application/vnd.github+json")
+              connection.putheader(
+                  "Authorization",
+                  f"Bearer {os.environ['REPOGUARD_GITHUB_TOKEN']}",
+              )
+              connection.putheader("Connection", "close")
+              connection.putheader("Host", "api.github.com")
+              connection.putheader("User-Agent", "RepoGuard-M6-Diagnostic")
+              connection.putheader("X-GitHub-Api-Version", "2022-11-28")
+              connection.endheaders()
+              response = connection.getresponse()
+              content = response.read(65_537)
+              probe["https"] = {
+                  "body_bytes": len(content),
+                  "header_count": len(response.getheaders()),
+                  "status": response.status,
+              }
+          except Exception as error:
+              failure = {
+                  "error_type": type(error).__name__,
+                  "stage": stage,
+              }
+              error_number = getattr(error, "errno", None)
+              verify_code = getattr(error, "verify_code", None)
+              if type(error_number) is int:
+                  failure["errno"] = error_number
+              if type(verify_code) is int:
+                  failure["verify_code"] = verify_code
+              probe["https"] = failure
+          finally:
+              if connection is not None:
+                  connection.close()
+
+          print(
+              json.dumps(
+                  probe,
+                  allow_nan=False,
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+          )
+          PY
 
       - name: Record exact review coordinates
         if: ${{ always() }}
