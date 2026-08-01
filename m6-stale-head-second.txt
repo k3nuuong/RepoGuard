@@ -1,0 +1,1 @@
+Second commit deliberately makes the first proposal stale.
